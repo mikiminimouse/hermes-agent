@@ -23,7 +23,8 @@ import {
   renameProfile,
   updateProfileSoul
 } from '@/hermes'
-import { AlertTriangle, Pencil, Plus, RefreshCw, Save, Terminal, Trash2, Users } from '@/lib/icons'
+import { Codicon } from '@/components/ui/codicon'
+import { AlertTriangle, Pencil, Save, Terminal, Trash2, Users } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
 
@@ -88,7 +89,7 @@ export function ProfilesView({
     setTitlebarToolGroup('profiles', [
       {
         disabled: refreshing,
-        icon: <RefreshCw className={cn(refreshing && 'animate-spin')} />,
+        icon: <Codicon name="refresh" spinning={refreshing} />,
         id: 'refresh-profiles',
         label: refreshing ? 'Refreshing profiles' : 'Refresh profiles',
         onSelect: () => void refresh()
@@ -179,7 +180,7 @@ export function ProfilesView({
             <aside className="flex min-h-0 flex-col overflow-hidden border-b border-border/50 lg:border-b-0 lg:border-r">
               <div className="border-b border-border/40 p-2">
                 <Button className="w-full" onClick={() => setCreateOpen(true)} size="sm">
-                  <Plus />
+                  <Codicon name="add" />
                   New profile
                 </Button>
               </div>

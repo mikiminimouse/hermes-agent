@@ -100,7 +100,9 @@ function parseMaybeRecord(value: unknown): Record<string, unknown> {
 
 const firstString = (...candidates: unknown[]): string => {
   for (const v of candidates) {
-    if (typeof v === 'string' && v) return v
+    if (typeof v === 'string' && v) {
+      return v
+    }
   }
 
   return ''
@@ -111,7 +113,9 @@ function delegateTaskPayloads(
   phase: 'running' | 'complete',
   sourceEventType?: string
 ): Record<string, unknown>[] {
-  if (payload?.name !== 'delegate_task') return []
+  if (payload?.name !== 'delegate_task') {
+    return []
+  }
 
   const args = parseMaybeRecord(payload.args ?? payload.input)
   const result = parseMaybeRecord(payload.result)
@@ -120,6 +124,7 @@ function delegateTaskPayloads(
   const status = phase === 'complete' ? (payload.error ? 'failed' : 'completed') : 'running'
   const toolId = payload.tool_id || payload.tool_call_id || payload.id || 'delegate_task'
   const progressText = firstString(payload.preview, payload.message, payload.context)
+
   const eventType =
     phase === 'complete'
       ? 'subagent.complete'
@@ -517,6 +522,8 @@ export function useMessageStream({
         const runningChanged = typeof payload?.running === 'boolean'
 
         if (apply) {
+          const runtimeInfo: { branch?: string; cwd?: string } = {}
+
           if (modelChanged) {
             setCurrentModel(payload!.model || '')
           }
@@ -527,10 +534,20 @@ export function useMessageStream({
 
           if (typeof payload?.cwd === 'string') {
             setCurrentCwd(payload.cwd)
+            runtimeInfo.cwd = payload.cwd
           }
 
           if (typeof payload?.branch === 'string') {
             setCurrentBranch(payload.branch)
+            runtimeInfo.branch = payload.branch
+          }
+
+          if (sessionId && (runtimeInfo.cwd !== undefined || runtimeInfo.branch !== undefined)) {
+            updateSessionState(sessionId, state => ({
+              ...state,
+              branch: runtimeInfo.branch ?? state.branch,
+              cwd: runtimeInfo.cwd ?? state.cwd
+            }))
           }
 
           if (typeof payload?.personality === 'string') {

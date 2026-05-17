@@ -3,7 +3,8 @@ import type { PointerEvent as ReactPointerEvent } from 'react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 import type { SetTitlebarToolGroup, TitlebarTool } from '@/app/shell/titlebar-controls'
-import { Bug, RefreshCw, X } from '@/lib/icons'
+import { Codicon } from '@/components/ui/codicon'
+import { Bug } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
 import { $previewServerRestart, failPreviewServerRestart, type PreviewTarget } from '@/store/preview'
@@ -301,13 +302,13 @@ export function PreviewPane({
           ]
         : []),
       {
-        icon: <RefreshCw className={cn(loading && 'animate-spin')} />,
+        icon: <Codicon name="refresh" spinning={loading} />,
         id: `${TITLEBAR_GROUP_ID}-reload`,
         label: 'Reload preview',
         onSelect: reloadPreview
       },
       {
-        icon: <X />,
+        icon: <Codicon name="close" />,
         id: `${TITLEBAR_GROUP_ID}-close`,
         label: 'Close preview',
         onSelect: onClose
@@ -534,7 +535,7 @@ export function PreviewPane({
     }
 
     const webview = document.createElement('webview') as PreviewWebview
-    webview.className = 'flex h-full w-full flex-1 bg-background'
+    webview.className = 'flex h-full w-full flex-1 bg-transparent'
     webview.setAttribute('partition', 'persist:hermes-preview')
     webview.setAttribute('src', target.url)
     webview.setAttribute('webpreferences', 'contextIsolation=yes,nodeIntegration=no,sandbox=yes')
@@ -626,7 +627,7 @@ export function PreviewPane({
   }, [appendConsoleEntry, consoleState, isWebPreview, target.url])
 
   return (
-    <aside className="relative flex h-full w-full min-w-0 flex-col overflow-hidden bg-background text-muted-foreground">
+    <aside className="relative flex h-full w-full min-w-0 flex-col overflow-hidden bg-transparent text-muted-foreground">
       <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
         {!embedded && (
           <div className="pointer-events-none flex min-h-(--titlebar-height) items-center gap-1.5 border-b border-border/60 bg-background px-2 py-1">
@@ -645,12 +646,12 @@ export function PreviewPane({
         )}
 
         <div
-          className="pointer-events-auto relative min-h-0 flex-1 overflow-hidden bg-background"
+          className="pointer-events-auto relative min-h-0 flex-1 overflow-hidden bg-transparent"
           ref={previewContentRef}
         >
           <div
             className={cn(
-              'absolute inset-0 flex bg-background',
+              'absolute inset-0 flex bg-transparent',
               (!isWebPreview || loadError) && 'pointer-events-none opacity-0'
             )}
             ref={hostRef}

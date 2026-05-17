@@ -16,11 +16,11 @@ import { Button } from '@/components/ui/button'
 import { getGlobalModelOptions, type HermesGateway } from '@/hermes'
 import type { ChatMessage } from '@/lib/chat-messages'
 import { quickModelOptions, sessionTitle, toRuntimeMessage } from '@/lib/chat-runtime'
-import { ChevronDown } from '@/lib/icons'
+import { Codicon } from '@/components/ui/codicon'
 import { useIncrementalExternalStoreRuntime } from '@/lib/incremental-external-store-runtime'
 import { cn } from '@/lib/utils'
-import { $pinnedSessionIds } from '@/store/layout'
 import type { ComposerAttachment } from '@/store/composer'
+import { $pinnedSessionIds } from '@/store/layout'
 import {
   $activeSessionId,
   $awaitingResponse,
@@ -92,32 +92,30 @@ function ChatHeader({
   const sessions = useStore($sessions)
   const pinnedSessionIds = useStore($pinnedSessionIds)
   const activeStoredSession = sessions.find(session => session.id === selectedSessionId) || null
-  const title = activeStoredSession ? sessionTitle(activeStoredSession) : ''
+  const title = activeStoredSession ? sessionTitle(activeStoredSession) : 'New agent'
   const selectedIsPinned = selectedSessionId ? pinnedSessionIds.includes(selectedSessionId) : false
 
   return (
     <header className={cn(titlebarHeaderBaseClass, isRoutedSessionView && titlebarHeaderShadowClass)}>
       <div className="min-w-0 flex-1">
-        {title && (
-          <SessionActionsMenu
-            align="start"
-            onDelete={selectedSessionId ? onDeleteSelectedSession : undefined}
-            onPin={selectedSessionId ? onToggleSelectedPin : undefined}
-            pinned={selectedIsPinned}
-            sessionId={selectedSessionId || activeSessionId || ''}
-            sideOffset={8}
-            title={title}
+        <SessionActionsMenu
+          align="start"
+          onDelete={selectedSessionId ? onDeleteSelectedSession : undefined}
+          onPin={selectedSessionId ? onToggleSelectedPin : undefined}
+          pinned={selectedIsPinned}
+          sessionId={selectedSessionId || activeSessionId || ''}
+          sideOffset={8}
+          title={title}
+        >
+          <Button
+            className="pointer-events-auto h-6 min-w-0 gap-1 rounded-md border border-transparent bg-(--ui-bg-quinary) px-2 py-0 text-(--ui-text-secondary) hover:border-(--ui-stroke-tertiary) hover:bg-(--ui-bg-tertiary) hover:text-foreground data-[state=open]:border-(--ui-stroke-tertiary) data-[state=open]:bg-(--ui-bg-tertiary) [-webkit-app-region:no-drag]"
+            type="button"
+            variant="ghost"
           >
-            <Button
-              className="pointer-events-auto h-7 min-w-0 gap-1.5 rounded-lg px-1 py-0 text-foreground hover:bg-accent/70 data-[state=open]:bg-accent/70 [-webkit-app-region:no-drag]"
-              type="button"
-              variant="ghost"
-            >
-              <h2 className="max-w-[62vw] truncate text-base font-semibold leading-none tracking-tight">{title}</h2>
-              <ChevronDown className="shrink-0 text-foreground/75" size={16} />
-            </Button>
-          </SessionActionsMenu>
-        )}
+            <h2 className="max-w-[52vw] truncate text-[0.75rem] font-medium leading-none">{title}</h2>
+            <Codicon className="shrink-0 text-(--ui-text-tertiary)" name="chevron-down" size="0.8125rem" />
+          </Button>
+        </SessionActionsMenu>
       </div>
     </header>
   )
@@ -271,7 +269,7 @@ export function ChatView({
   return (
     <div
       className={cn(
-        'relative flex h-full min-w-0 flex-col overflow-hidden rounded-b-[0.9375rem] bg-transparent',
+        'relative flex h-full min-w-0 flex-col overflow-hidden bg-(--glass-chat-surface-background)',
         className
       )}
     >
@@ -285,13 +283,17 @@ export function ChatView({
 
       <NotificationStack />
 
-      <div className="relative min-h-0 max-w-full flex-1 overflow-hidden rounded-b-[1.0625rem] bg-transparent contain-[layout_paint]">
+      <div className="relative min-h-0 max-w-full flex-1 overflow-hidden bg-(--glass-chat-surface-background) contain-[layout_paint]">
         <AssistantRuntimeProvider runtime={runtime}>
           <Thread
             clampToComposer={showChatBar}
+            cwd={currentCwd}
+            gateway={gateway}
             intro={showIntro ? { personality: introPersonality, seed: introSeed } : undefined}
             loading={threadLoading}
             onBranchInNewChat={onBranchInNewChat}
+            onCancel={onCancel}
+            sessionId={activeSessionId}
             sessionKey={threadKey}
           />
           {showChatBar && (

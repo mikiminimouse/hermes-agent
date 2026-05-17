@@ -104,7 +104,7 @@ export function chatMessageText(message: ChatMessage): string {
 
 const ATTACHED_CONTEXT_MARKER_RE = /(?:^|\n)--- Attached Context ---\s*\n/
 const CONTEXT_WARNINGS_MARKER_RE = /(?:^|\n)--- Context Warnings ---[\s\S]*$/
-const CONTEXT_REF_RE = /@(file|folder|url|image|tool):(?:"[^"\n]+"|'[^'\n]+'|`[^`\n]+`|\S+)/g
+const CONTEXT_REF_RE = /@(file|folder|url|image|tool|terminal):(?:"[^"\n]+"|'[^'\n]+'|`[^`\n]+`|\S+)/g
 
 function textFromUnknown(value: unknown, depth = 0): string {
   if (typeof value === 'string') {
@@ -435,6 +435,7 @@ export function upsertToolPart(
   if (index === -1) {
     return [...next, base]
   }
+
   next[index] = { ...next[index], ...base }
 
   return next

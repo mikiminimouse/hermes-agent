@@ -1,9 +1,9 @@
-import { IconBookmark, IconBookmarkFilled, IconCircleX, IconFileDownload, IconPencil } from '@tabler/icons-react'
 import { useEffect, useRef, useState } from 'react'
 import type * as React from 'react'
 import type { ReactNode } from 'react'
 
 import { Button } from '@/components/ui/button'
+import { Codicon } from '@/components/ui/codicon'
 import { CopyButton } from '@/components/ui/copy-button'
 import {
   Dialog,
@@ -17,14 +17,13 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
-  DropdownMenuSeparator,
   DropdownMenuTrigger
 } from '@/components/ui/dropdown-menu'
 import { Input } from '@/components/ui/input'
 import { renameSession } from '@/hermes'
 import { triggerHaptic } from '@/lib/haptics'
+import { Pin } from '@/lib/icons'
 import { exportSession } from '@/lib/session-export'
-import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
 import { setSessions } from '@/store/session'
 
@@ -56,54 +55,46 @@ export function SessionActionsMenu({
     <>
       <DropdownMenu>
         <DropdownMenuTrigger asChild>{children}</DropdownMenuTrigger>
-        <DropdownMenuContent align={align} aria-label={`Actions for ${title}`} className="w-44" sideOffset={sideOffset}>
+        <DropdownMenuContent align={align} aria-label={`Actions for ${title}`} className="w-40" sideOffset={sideOffset}>
           <DropdownMenuItem
-            className="gap-2.5 text-foreground focus:bg-accent [&_svg]:size-4"
             disabled={!onPin}
             onSelect={() => {
               triggerHaptic('selection')
               onPin?.()
             }}
           >
-            {pinned ? <IconBookmarkFilled /> : <IconBookmark />}
+            <Pin className="size-3.5" strokeWidth={1.75} />
             <span>{pinned ? 'Unpin' : 'Pin'}</span>
           </DropdownMenuItem>
           <CopyButton
             appearance="menu-item"
-            className="gap-2.5 text-foreground focus:bg-accent [&_svg]:size-4"
             disabled={!sessionId}
             errorMessage="Could not copy session ID"
             label="Copy ID"
             text={sessionId}
           />
           <DropdownMenuItem
-            className="gap-2.5 text-foreground focus:bg-accent [&_svg]:size-4"
             disabled={!sessionId}
             onSelect={() => {
               triggerHaptic('selection')
               void exportSession(sessionId, { title })
             }}
           >
-            <IconFileDownload />
+            <Codicon name="cloud-download" size="0.875rem" />
             <span>Export</span>
           </DropdownMenuItem>
           <DropdownMenuItem
-            className="gap-2.5 text-foreground focus:bg-accent [&_svg]:size-4"
             disabled={!sessionId}
             onSelect={() => {
               triggerHaptic('selection')
               setRenameOpen(true)
             }}
           >
-            <IconPencil />
+            <Codicon name="edit" size="0.875rem" />
             <span>Rename</span>
           </DropdownMenuItem>
-          <DropdownMenuSeparator className="my-3" />
           <DropdownMenuItem
-            className={cn(
-              'gap-2.5 text-foreground focus:bg-accent [&_svg]:size-4',
-              'text-destructive focus:text-destructive'
-            )}
+            className="text-destructive focus:text-destructive"
             disabled={!onDelete}
             onSelect={() => {
               triggerHaptic('warning')
@@ -111,7 +102,7 @@ export function SessionActionsMenu({
             }}
             variant="destructive"
           >
-            <IconCircleX />
+            <Codicon name="trash" size="0.875rem" />
             <span>Delete</span>
           </DropdownMenuItem>
         </DropdownMenuContent>

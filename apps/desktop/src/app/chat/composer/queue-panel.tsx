@@ -1,7 +1,8 @@
 import { useState } from 'react'
 
 import { Button } from '@/components/ui/button'
-import { ArrowUp, ChevronDown, Pencil, Trash2 } from '@/lib/icons'
+import { DisclosureCaret } from '@/components/ui/disclosure-caret'
+import { ArrowUp, Pencil, Trash2 } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import type { QueuedPromptEntry } from '@/store/composer-queue'
 
@@ -29,7 +30,7 @@ export function QueuePanel({ busy, editingId, entries, onDelete, onEdit, onSendN
         onClick={() => setCollapsed(open => !open)}
         type="button"
       >
-        <ChevronDown className={cn('shrink-0 transition-transform', collapsed && '-rotate-90')} size={14} />
+        <DisclosureCaret className="shrink-0" open={!collapsed} size="0.875rem" />
         <span className="truncate">{entries.length} Queued</span>
       </button>
 

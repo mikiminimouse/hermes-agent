@@ -3,20 +3,19 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 
 import { PageLoader } from '@/components/page-loader'
 import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
 import { getSkills, getToolsets, toggleSkill } from '@/hermes'
-import { Brain, RefreshCw, Search, Wrench, X } from '@/lib/icons'
-import type { LucideIcon } from '@/lib/icons'
+import { Codicon } from '@/components/ui/codicon'
+import { Brain, Wrench } from '@/lib/icons'
+import type { IconComponent } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
 import type { SkillInfo, ToolsetInfo } from '@/types/hermes'
 
 import { useRouteEnumParam } from '../hooks/use-route-enum-param'
+import { PageSearchShell } from '../page-search-shell'
 import { asText, includesQuery, prettyName, toolNames } from '../settings/helpers'
 import type { SetStatusbarItemGroup } from '../shell/statusbar-controls'
-import { titlebarHeaderBaseClass } from '../shell/titlebar'
-import type { SetTitlebarToolGroup } from '../shell/titlebar-controls'
 
 const SKILLS_MODES = ['skills', 'toolsets'] as const
 type SkillsMode = (typeof SKILLS_MODES)[number]
@@ -64,12 +63,10 @@ function filteredToolsets(toolsets: ToolsetInfo[], query: string): ToolsetInfo[]
 
 interface SkillsViewProps extends React.ComponentProps<'section'> {
   setStatusbarItemGroup?: SetStatusbarItemGroup
-  setTitlebarToolGroup?: SetTitlebarToolGroup
 }
 
 export function SkillsView({
   setStatusbarItemGroup: _setStatusbarItemGroup,
-  setTitlebarToolGroup,
   ...props
 }: SkillsViewProps) {
   const [mode, setMode] = useRouteEnumParam('tab', SKILLS_MODES, 'skills')
@@ -98,24 +95,6 @@ export function SkillsView({
   useEffect(() => {
     void refreshCapabilities()
   }, [refreshCapabilities])
-
-  useEffect(() => {
-    if (!setTitlebarToolGroup) {
-      return
-    }
-
-    setTitlebarToolGroup('skills', [
-      {
-        disabled: refreshing,
-        icon: <RefreshCw className={cn(refreshing && 'animate-spin')} />,
-        id: 'refresh-skills',
-        label: refreshing ? 'Refreshing skills' : 'Refresh skills',
-        onSelect: () => void refreshCapabilities()
-      }
-    ])
-
-    return () => setTitlebarToolGroup('skills', [])
-  }, [refreshCapabilities, refreshing, setTitlebarToolGroup])
 
   const categories = useMemo(() => {
     if (!skills) {
@@ -153,7 +132,6 @@ export function SkillsView({
   }, [visibleSkills])
 
   const totalSkills = skills?.length || 0
-  const enabledSkills = skills?.filter(skill => skill.enabled).length || 0
   const enabledToolsets = toolsets?.filter(toolset => toolset.enabled).length || 0
 
   async function handleToggleSkill(skill: SkillInfo, enabled: boolean) {
@@ -175,17 +153,11 @@ export function SkillsView({
   }
 
   return (
-    <section {...props} className="flex h-full min-w-0 flex-col overflow-hidden rounded-b-[0.9375rem] bg-background">
-      <header className={titlebarHeaderBaseClass}>
-        <h2 className="pointer-events-auto text-base font-semibold leading-none tracking-tight">Skills</h2>
-        <span className="pointer-events-auto text-xs text-muted-foreground">
-          {enabledSkills}/{totalSkills} enabled
-        </span>
-      </header>
-
-      <div className="min-h-0 flex-1 overflow-hidden rounded-b-[1.0625rem] border border-border/50 bg-background/85">
-        <div className="border-b border-border/50 px-4 py-3">
-          <div className="flex flex-wrap items-center gap-2">
+    <PageSearchShell
+      {...props}
+      filters={
+        <>
+          <div className="flex flex-wrap items-center justify-center gap-1.5">
             <ModeButton active={mode === 'skills'} icon={Brain} onClick={() => setMode('skills')} text="Skills" />
             <ModeButton
               active={mode === 'toolsets'}
@@ -193,33 +165,9 @@ export function SkillsView({
               onClick={() => setMode('toolsets')}
               text="Toolsets"
             />
-            <div className="ml-auto w-full max-w-sm min-w-64">
-              <div className="relative">
-                <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
-                <Input
-                  className="h-8 rounded-lg pl-8 pr-8 text-sm"
-                  onChange={event => setQuery(event.target.value)}
-                  placeholder={mode === 'skills' ? 'Search skills...' : 'Search toolsets...'}
-                  value={query}
-                />
-                {query && (
-                  <Button
-                    aria-label="Clear search"
-                    className="absolute right-1 top-1/2 h-6 w-6 -translate-y-1/2 text-muted-foreground hover:text-foreground"
-                    onClick={() => setQuery('')}
-                    size="icon"
-                    type="button"
-                    variant="ghost"
-                  >
-                    <X className="size-3.5" />
-                  </Button>
-                )}
-              </div>
-            </div>
           </div>
-
           {mode === 'skills' && categories.length > 0 && (
-            <div className="mt-2 flex flex-wrap gap-1.5">
+            <div className="flex flex-wrap justify-center gap-1.5">
               <CategoryButton
                 active={activeCategory === null}
                 count={totalSkills}
@@ -237,7 +185,26 @@ export function SkillsView({
               ))}
             </div>
           )}
-        </div>
+        </>
+      }
+      onSearchChange={setQuery}
+      searchPlaceholder={mode === 'skills' ? 'Search skills...' : 'Search toolsets...'}
+      searchTrailingAction={
+        <Button
+          aria-label={refreshing ? 'Refreshing skills' : 'Refresh skills'}
+          className="text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground"
+          disabled={refreshing}
+          onClick={() => void refreshCapabilities()}
+          size="icon-xs"
+          title={refreshing ? 'Refreshing skills' : 'Refresh skills'}
+          type="button"
+          variant="ghost"
+        >
+          <Codicon name="refresh" size="0.875rem" spinning={refreshing} />
+        </Button>
+      }
+      searchValue={query}
+    >
 
         {!skills || !toolsets ? (
           <PageLoader label="Loading capabilities..." />
@@ -252,10 +219,10 @@ export function SkillsView({
                     <div className="text-[0.68rem] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
                       {prettyName(category)}
                     </div>
-                    <div className="divide-y divide-border/40 rounded-lg border border-border/40 bg-background/70">
+                    <div className="divide-y divide-(--ui-stroke-quaternary)">
                       {list.map(skill => (
                         <div
-                          className="grid gap-3 px-3 py-2.5 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center"
+                          className="grid gap-3 px-0 py-2.5 transition-colors hover:bg-(--ui-bg-quinary) sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center"
                           key={skill.name}
                         >
                           <div className="min-w-0">
@@ -286,13 +253,13 @@ export function SkillsView({
                 <div className="text-xs text-muted-foreground">
                   {enabledToolsets}/{toolsets.length} toolsets enabled
                 </div>
-                <div className="divide-y divide-border/40 rounded-lg border border-border/40 bg-background/70">
+                <div className="divide-y divide-(--ui-stroke-quaternary)">
                   {visibleToolsets.map(toolset => {
                     const tools = toolNames(toolset)
                     const label = asText(toolset.label || toolset.name)
 
                     return (
-                      <div className="px-3 py-2.5" key={toolset.name}>
+                      <div className="px-0 py-2.5 transition-colors hover:bg-(--ui-bg-quinary)" key={toolset.name}>
                         <div className="flex items-center justify-between gap-2">
                           <div className="truncate text-sm font-medium">{label}</div>
                           <div className="flex items-center gap-1.5">
@@ -309,7 +276,7 @@ export function SkillsView({
                           <div className="mt-2 flex flex-wrap gap-1">
                             {tools.map(name => (
                               <span
-                                className="rounded-md bg-muted px-1.5 py-0.5 font-mono text-[0.65rem] text-muted-foreground"
+                                className="rounded-md bg-(--ui-bg-quinary) px-1.5 py-0.5 font-mono text-[0.65rem] text-(--ui-text-tertiary)"
                                 key={name}
                               >
                                 {name}
@@ -325,8 +292,7 @@ export function SkillsView({
             )}
           </div>
         )}
-      </div>
-    </section>
+    </PageSearchShell>
   )
 }
 
@@ -337,7 +303,7 @@ function ModeButton({
   text
 }: {
   active: boolean
-  icon: LucideIcon
+  icon: IconComponent
   onClick: () => void
   text: string
 }) {
@@ -345,7 +311,9 @@ function ModeButton({
     <Button
       className={cn(
         'h-8 gap-1.5 rounded-md px-2.5 text-xs',
-        active ? 'bg-accent text-foreground' : 'text-muted-foreground hover:text-foreground'
+        active
+          ? 'bg-(--ui-bg-tertiary) text-foreground'
+          : 'text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground'
       )}
       onClick={onClick}
       size="sm"
@@ -372,8 +340,10 @@ function CategoryButton({
   return (
     <button
       className={cn(
-        'inline-flex h-7 items-center gap-1 bg-transparent px-1.5 text-[0.68rem] transition-colors',
-        active ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'
+        'inline-flex h-7 items-center gap-1 rounded-md bg-transparent px-1.5 text-[0.68rem] transition-colors',
+        active
+          ? 'bg-(--ui-bg-tertiary) text-foreground'
+          : 'text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground'
       )}
       onClick={onClick}
       type="button"
@@ -393,7 +363,9 @@ function StatusPill({ active, children }: { active: boolean; children: string })
     <span
       className={cn(
         'inline-flex items-center rounded-full px-1.5 py-0.5 text-[0.64rem]',
-        active ? 'bg-primary/10 text-primary' : 'bg-muted text-muted-foreground'
+        active
+          ? 'bg-(--ui-bg-tertiary) text-(--ui-text-secondary)'
+          : 'bg-(--ui-bg-quinary) text-(--ui-text-tertiary)'
       )}
     >
       {children}

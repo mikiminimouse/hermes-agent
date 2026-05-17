@@ -23,6 +23,7 @@ import {
   $composerAttachments,
   addComposerAttachment,
   clearComposerAttachments,
+  terminalContextBlocksFromDraft,
   type ComposerAttachment
 } from '@/store/composer'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
@@ -206,11 +207,13 @@ export function usePromptActions({
         .map(a => a.refText)
         .filter(Boolean)
         .join('\n')
+      const terminalContextBlocks = terminalContextBlocksFromDraft(rawText).join('\n\n')
       const hasImage = attachments.some(a => a.kind === 'image')
       const attachmentRefs = attachments.map(attachmentDisplayText).filter((r): r is string => Boolean(r))
 
       const text =
-        [contextRefs, visibleText].filter(Boolean).join('\n\n') || (hasImage ? 'What do you see in this image?' : '')
+        [contextRefs, terminalContextBlocks, visibleText].filter(Boolean).join('\n\n') ||
+        (hasImage ? 'What do you see in this image?' : '')
 
       if (!text || busyRef.current) {
         return false

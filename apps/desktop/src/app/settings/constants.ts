@@ -1,7 +1,7 @@
 import {
   Brain,
   Lock,
-  type LucideIcon,
+  type IconComponent,
   MessageCircle,
   Mic,
   Monitor,
@@ -302,7 +302,7 @@ export interface ModeOption {
   id: ThemeMode
   label: string
   description: string
-  icon: LucideIcon
+  icon: IconComponent
 }
 
 export const MODE_OPTIONS: ModeOption[] = [

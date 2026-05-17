@@ -12,6 +12,7 @@ import { $pinnedSessionIds } from '@/store/layout'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { requestDesktopOnboarding } from '@/store/onboarding'
 import {
+  $currentCwd,
   $messages,
   $sessions,
   setActiveSessionId,
@@ -166,6 +167,7 @@ function upsertOptimisticSession(
   const now = Date.now() / 1000
 
   const session: SessionInfo = {
+    cwd: created.info?.cwd ?? null,
     ended_at: null,
     id,
     input_tokens: 0,
@@ -184,10 +186,20 @@ function upsertOptimisticSession(
   setSessions(prev => [session, ...prev.filter(s => s.id !== id)])
 }
 
-function applyRuntimeInfo(info: SessionCreateResponse['info'] | undefined) {
-  if (!info) {
+function patchSessionWorkspace(sessionId: string, cwd: string | undefined) {
+  if (!cwd) {
     return
   }
+
+  setSessions(prev => prev.map(session => (session.id === sessionId ? { ...session, cwd } : session)))
+}
+
+function applyRuntimeInfo(info: SessionCreateResponse['info'] | undefined): Partial<Pick<ClientSessionState, 'branch' | 'cwd'>> | null {
+  if (!info) {
+    return null
+  }
+
+  const sessionState: Partial<Pick<ClientSessionState, 'branch' | 'cwd'>> = {}
 
   if (info.credential_warning) {
     requestDesktopOnboarding(info.credential_warning)
@@ -203,10 +215,12 @@ function applyRuntimeInfo(info: SessionCreateResponse['info'] | undefined) {
 
   if (info.cwd) {
     setCurrentCwd(info.cwd)
+    sessionState.cwd = info.cwd
   }
 
   if (info.branch !== undefined) {
     setCurrentBranch(info.branch || '')
+    sessionState.branch = info.branch || ''
   }
 
   if (typeof info.personality === 'string') {
@@ -228,6 +242,8 @@ function applyRuntimeInfo(info: SessionCreateResponse['info'] | undefined) {
   if (info.usage) {
     setCurrentUsage(current => ({ ...current, ...info.usage }))
   }
+
+  return sessionState
 }
 
 export function useSessionActions({
@@ -269,6 +285,8 @@ export function useSessionActions({
       })
       setSessionStartedAt(null)
       setTurnStartedAt(null)
+      setCurrentCwd('')
+      setCurrentBranch('')
       clearComposerDraft()
       clearComposerAttachments()
       setFreshDraftReady(true)
@@ -284,7 +302,8 @@ export function useSessionActions({
     creatingSessionRef.current = true
 
     try {
-      const created = await requestGateway<SessionCreateResponse>('session.create', { cols: 96 })
+      const cwd = $currentCwd.get().trim()
+      const created = await requestGateway<SessionCreateResponse>('session.create', { cols: 96, ...(cwd && { cwd }) })
       const stored = created.stored_session_id ?? null
 
       if (
@@ -310,7 +329,11 @@ export function useSessionActions({
       setActiveSessionId(created.session_id)
       setSelectedStoredSessionId(stored)
       setSessionStartedAt(Date.now())
-      applyRuntimeInfo(created.info)
+      const runtimeInfo = applyRuntimeInfo(created.info)
+
+      if (runtimeInfo) {
+        updateSessionState(created.session_id, state => ({ ...state, ...runtimeInfo }), stored)
+      }
 
       return created.session_id
     } finally {
@@ -325,7 +348,8 @@ export function useSessionActions({
     getRouteToken,
     navigate,
     requestGateway,
-    selectedStoredSessionIdRef
+    selectedStoredSessionIdRef,
+    updateSessionState
   ])
 
   const selectSidebarItem = useCallback(
@@ -376,6 +400,8 @@ export function useSessionActions({
         setActiveSessionId(cachedRuntimeId)
         activeSessionIdRef.current = cachedRuntimeId
         syncSessionStateToView(cachedRuntimeId, cachedState)
+        setCurrentCwd(cachedState.cwd)
+        setCurrentBranch(cachedState.branch)
         setSessionStartedAt(Date.now())
         clearComposerDraft()
         clearComposerAttachments()
@@ -467,10 +493,15 @@ export function useSessionActions({
 
         setActiveSessionId(resumed.session_id)
         activeSessionIdRef.current = resumed.session_id
+        const runtimeInfo = applyRuntimeInfo(resumed.info)
+
+        patchSessionWorkspace(storedSessionId, runtimeInfo?.cwd)
+
         updateSessionState(
           resumed.session_id,
           state => ({
             ...state,
+            ...(runtimeInfo ?? {}),
             messages: messagesForView,
             busy: false,
             awaitingResponse: false
@@ -479,7 +510,6 @@ export function useSessionActions({
         )
         clearComposerDraft()
         clearComposerAttachments()
-        applyRuntimeInfo(resumed.info)
       } catch (err) {
         if (!isCurrentResume()) {
           return
@@ -570,8 +600,11 @@ export function useSessionActions({
 
         clearNotifications()
 
+        const cwd = $currentCwd.get().trim()
+
         const branched = await requestGateway<SessionCreateResponse>('session.create', {
           cols: 96,
+          ...(cwd && { cwd }),
           messages: branchMessages.map(({ content, role }) => ({ content, role })),
           title: 'Branch'
         })
@@ -600,7 +633,13 @@ export function useSessionActions({
 
         clearComposerDraft()
         clearComposerAttachments()
-        applyRuntimeInfo(branched.info)
+        const runtimeInfo = applyRuntimeInfo(branched.info)
+
+        patchSessionWorkspace(routedSessionId, runtimeInfo?.cwd)
+
+        if (runtimeInfo) {
+          updateSessionState(branched.session_id, state => ({ ...state, ...runtimeInfo }), routedSessionId)
+        }
 
         return true
       } catch (err) {

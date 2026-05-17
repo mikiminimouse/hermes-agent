@@ -39,6 +39,8 @@ export function createClientSessionState(
   return {
     storedSessionId,
     messages,
+    branch: '',
+    cwd: '',
     busy: false,
     awaitingResponse: false,
     streamId: null,
@@ -145,6 +147,10 @@ export function pathLabel(path: string): string {
 }
 
 export function attachmentDisplayText(attachment: ComposerAttachment): string | null {
+  if (attachment.kind === 'terminal' && attachment.detail) {
+    return `\`\`\`terminal\n${attachment.detail.trim()}\n\`\`\``
+  }
+
   if (attachment.refText) {
     return attachment.refText
   }

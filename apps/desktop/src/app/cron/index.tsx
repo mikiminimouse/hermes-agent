@@ -24,13 +24,13 @@ import {
   triggerCronJob,
   updateCronJob
 } from '@/hermes'
-import { AlertTriangle, Clock, Pause, Pencil, Play, Plus, RefreshCw, Search, Trash2, X, Zap } from '@/lib/icons'
+import { Codicon } from '@/components/ui/codicon'
+import { AlertTriangle, Clock, Pause, Pencil, Play, Trash2, Zap } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
 
+import { PageSearchShell } from '../page-search-shell'
 import type { SetStatusbarItemGroup } from '../shell/statusbar-controls'
-import { titlebarHeaderBaseClass } from '../shell/titlebar'
-import type { SetTitlebarToolGroup } from '../shell/titlebar-controls'
 
 const DEFAULT_DELIVER = 'local'
 
@@ -295,12 +295,10 @@ function matchesQuery(job: CronJob, q: string): boolean {
 
 interface CronViewProps extends React.ComponentProps<'section'> {
   setStatusbarItemGroup?: SetStatusbarItemGroup
-  setTitlebarToolGroup?: SetTitlebarToolGroup
 }
 
 export function CronView({
   setStatusbarItemGroup: _setStatusbarItemGroup,
-  setTitlebarToolGroup,
   ...props
 }: CronViewProps) {
   const [jobs, setJobs] = useState<CronJob[] | null>(null)
@@ -328,24 +326,6 @@ export function CronView({
   useEffect(() => {
     void refresh()
   }, [refresh])
-
-  useEffect(() => {
-    if (!setTitlebarToolGroup) {
-      return
-    }
-
-    setTitlebarToolGroup('cron', [
-      {
-        disabled: refreshing,
-        icon: <RefreshCw className={cn(refreshing && 'animate-spin')} />,
-        id: 'refresh-cron',
-        label: refreshing ? 'Refreshing cron jobs' : 'Refresh cron jobs',
-        onSelect: () => void refresh()
-      }
-    ])
-
-    return () => setTitlebarToolGroup('cron', [])
-  }, [refresh, refreshing, setTitlebarToolGroup])
 
   const visibleJobs = useMemo(() => {
     if (!jobs) {
@@ -437,78 +417,66 @@ export function CronView({
   }
 
   return (
-    <section {...props} className="flex h-full min-w-0 flex-col overflow-hidden rounded-b-[0.9375rem] bg-background">
-      <header className={titlebarHeaderBaseClass}>
-        <h2 className="pointer-events-auto text-base font-semibold leading-none tracking-tight">Cron</h2>
-        <span className="pointer-events-auto text-xs text-muted-foreground">
-          {totalCount === 0 ? 'No scheduled jobs' : `${enabledCount}/${totalCount} active`}
-        </span>
-      </header>
-
-      <div className="min-h-0 flex-1 overflow-hidden rounded-b-[1.0625rem] border border-border/50 bg-background/85">
-        <div className="border-b border-border/50 px-4 py-3">
-          <div className="flex flex-wrap items-center gap-2">
-            <Button onClick={() => setEditor({ mode: 'create' })} size="sm">
-              <Plus />
-              New cron
-            </Button>
-
-            <div className="ml-auto w-full max-w-sm min-w-64">
-              <div className="relative">
-                <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
-                <Input
-                  className="h-8 rounded-lg pl-8 pr-8 text-sm"
-                  onChange={event => setQuery(event.target.value)}
-                  placeholder="Search cron jobs..."
-                  value={query}
-                />
-                {query && (
-                  <Button
-                    aria-label="Clear search"
-                    className="absolute right-1 top-1/2 h-6 w-6 -translate-y-1/2 text-muted-foreground hover:text-foreground"
-                    onClick={() => setQuery('')}
-                    size="icon"
-                    type="button"
-                    variant="ghost"
-                  >
-                    <X className="size-3.5" />
-                  </Button>
-                )}
-              </div>
-            </div>
+    <PageSearchShell
+      {...props}
+      filters={
+        <div className="flex flex-wrap items-center justify-center gap-2">
+          <Button onClick={() => setEditor({ mode: 'create' })} size="sm">
+            <Codicon name="add" />
+            New cron
+          </Button>
+        </div>
+      }
+      onSearchChange={setQuery}
+      searchPlaceholder="Search cron jobs..."
+      searchTrailingAction={
+        <Button
+          aria-label={refreshing ? 'Refreshing cron jobs' : 'Refresh cron jobs'}
+          className="text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground"
+          disabled={refreshing}
+          onClick={() => void refresh()}
+          size="icon-xs"
+          title={refreshing ? 'Refreshing cron jobs' : 'Refresh cron jobs'}
+          type="button"
+          variant="ghost"
+        >
+          <Codicon name="refresh" size="0.875rem" spinning={refreshing} />
+        </Button>
+      }
+      searchValue={query}
+    >
+      {!jobs ? (
+        <PageLoader label="Loading cron jobs..." />
+      ) : visibleJobs.length === 0 ? (
+        <EmptyState
+          actionLabel={totalCount === 0 ? 'Create first cron' : undefined}
+          description={
+            totalCount === 0
+              ? 'Schedule a prompt to run on a cron expression. Hermes will run it and deliver results to the destination you pick.'
+              : 'Try a broader search query.'
+          }
+          onAction={totalCount === 0 ? () => setEditor({ mode: 'create' }) : undefined}
+          title={totalCount === 0 ? 'No scheduled jobs yet' : 'No matches'}
+        />
+      ) : (
+        <div className="h-full overflow-y-auto px-4 py-3">
+          <div className="divide-y divide-border/40 rounded-lg border border-border/40 bg-background/70">
+            {visibleJobs.map(job => (
+              <CronJobRow
+                busy={busyJobId === job.id}
+                job={job}
+                key={job.id}
+                onDelete={() => setPendingDelete(job)}
+                onEdit={() => setEditor({ mode: 'edit', job })}
+                onPauseResume={() => void handlePauseResume(job)}
+                onTrigger={() => void handleTrigger(job)}
+              />
+            ))}
           </div>
         </div>
-
-        {!jobs ? (
-          <PageLoader label="Loading cron jobs..." />
-        ) : visibleJobs.length === 0 ? (
-          <EmptyState
-            actionLabel={totalCount === 0 ? 'Create first cron' : undefined}
-            description={
-              totalCount === 0
-                ? 'Schedule a prompt to run on a cron expression. Hermes will run it and deliver results to the destination you pick.'
-                : 'Try a broader search query.'
-            }
-            onAction={totalCount === 0 ? () => setEditor({ mode: 'create' }) : undefined}
-            title={totalCount === 0 ? 'No scheduled jobs yet' : 'No matches'}
-          />
-        ) : (
-          <div className="h-full overflow-y-auto px-4 py-3">
-            <div className="divide-y divide-border/40 rounded-lg border border-border/40 bg-background/70">
-              {visibleJobs.map(job => (
-                <CronJobRow
-                  busy={busyJobId === job.id}
-                  job={job}
-                  key={job.id}
-                  onDelete={() => setPendingDelete(job)}
-                  onEdit={() => setEditor({ mode: 'edit', job })}
-                  onPauseResume={() => void handlePauseResume(job)}
-                  onTrigger={() => void handleTrigger(job)}
-                />
-              ))}
-            </div>
-          </div>
-        )}
+      )}
+      <div className="hidden">
+        {totalCount === 0 ? 'No scheduled jobs' : `${enabledCount}/${totalCount} active`}
       </div>
 
       <CronEditorDialog editor={editor} onClose={() => setEditor({ mode: 'closed' })} onSave={handleEditorSave} />
@@ -536,7 +504,7 @@ export function CronView({
           </DialogFooter>
         </DialogContent>
       </Dialog>
-    </section>
+    </PageSearchShell>
   )
 }
 
@@ -656,7 +624,7 @@ function EmptyState({
         <p className="text-xs text-muted-foreground">{description}</p>
         {actionLabel && onAction && (
           <Button className="mt-2" onClick={onAction} size="sm">
-            <Plus />
+            <Codicon name="add" />
             {actionLabel}
           </Button>
         )}
