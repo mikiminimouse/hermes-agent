@@ -195,12 +195,6 @@ function useThreadScrollAnchor({ enabled, groupCount, scrollerRef, sessionKey, v
   const prevSessionKeyRef = useRef(sessionKey)
   const prevGroupCountRef = useRef(0)
 
-  // Track repins-in-a-row to break runaway loops during rapid layout churn.
-  // In healthy paths this drains to zero between frames; we only need the
-  // ceiling for pathological streaming bursts where content height keeps
-  // growing every frame.
-  const inFlightPinDepthRef = useRef(0)
-
   const pinToBottom = useCallback(() => {
     const el = scrollerRef.current
 
@@ -247,40 +241,19 @@ function useThreadScrollAnchor({ enabled, groupCount, scrollerRef, sessionKey, v
       const top = el.scrollTop
 
       // If this scroll event is the consequence of `pinToBottom` writing
-      // `el.scrollTop`, treat it as ours: never disarm, just consume the
-      // gate. If we landed short of bottom (because content also grew in
-      // the same frame and the browser clamped our scrollTop = scrollHeight
-      // write to the now-stale scrollHeight - clientHeight), schedule
-      // another pin on the next frame. Without this the post-pin scrollTop
-      // gets misread as the user scrolling up, disarming sticky-bottom
-      // permanently and leaving the just-submitted message below the fold.
+      // `el.scrollTop`, treat it as ours: don't disarm. The RO + rAF pin
+      // loop will re-pin on the next frame if the browser clamped us
+      // short of bottom (because content grew in the same frame).
+      // Without this guard the post-pin scrollTop gets misread as the
+      // user scrolling up, disarming sticky-bottom permanently and
+      // leaving the just-submitted message below the fold.
       if (programmaticScrollPendingRef.current > 0) {
         programmaticScrollPendingRef.current -= 1
         lastTopRef.current = top
-        // Stay armed regardless — sticky-bottom should hold through clamp
-        // races.
+        // Always re-arm — sticky-bottom should hold through clamp races.
         armedRef.current = true
         const atBottom = el.scrollHeight - (top + el.clientHeight) <= AT_BOTTOM_THRESHOLD
         setThreadScrolledUp(!atBottom)
-
-        if (atBottom) {
-          inFlightPinDepthRef.current = 0
-        } else if (inFlightPinDepthRef.current < 8) {
-          // Re-pin synchronously: the browser already laid out for this
-          // scroll event, so reading scrollHeight now gives us the up-to-date
-          // value and writing scrollTop lands us at the actual bottom in the
-          // same frame. Doing this in a rAF causes a 1-frame visual flicker
-          // (distFromBottom briefly nonzero), so we accept one extra
-          // synchronous pin cycle (which goes back through this very
-          // handler with the counter incremented and arm preserved). The
-          // depth guard prevents pathological runaway loops if content
-          // height keeps growing every frame; 8 is generous for any
-          // realistic rendering pattern.
-          inFlightPinDepthRef.current += 1
-          pinToBottom()
-        } else {
-          inFlightPinDepthRef.current = 0
-        }
 
         return
       }
@@ -318,7 +291,11 @@ function useThreadScrollAnchor({ enabled, groupCount, scrollerRef, sessionKey, v
   }, [scrollerRef])
 
   // Follow content growth (streaming, item measurements, loading indicator)
-  // while armed.
+  // while armed. During fast streaming the ResizeObserver can fire many
+  // times per frame as Streamdown re-tokenizes; coalesce to one pin per
+  // animation frame so we don't run the scroll-event/re-pin chain
+  // (~20+ ms self in `Virtualizer.getMaxScrollOffset`) several times per
+  // token.
   useEffect(() => {
     if (!enabled) {
       return undefined
@@ -330,11 +307,21 @@ function useThreadScrollAnchor({ enabled, groupCount, scrollerRef, sessionKey, v
       return undefined
     }
 
-    const observer = new ResizeObserver(() => {
-      if (armedRef.current) {
-        pinToBottom()
+    let pinRafScheduled = false
+    const schedulePin = () => {
+      if (pinRafScheduled || !armedRef.current) {
+        return
       }
-    })
+      pinRafScheduled = true
+      requestAnimationFrame(() => {
+        pinRafScheduled = false
+        if (armedRef.current) {
+          pinToBottom()
+        }
+      })
+    }
+
+    const observer = new ResizeObserver(schedulePin)
 
     observer.observe(el)
 
@@ -366,6 +353,15 @@ function useThreadScrollAnchor({ enabled, groupCount, scrollerRef, sessionKey, v
   // mutation but before the browser paints. Without this, there's a ~50ms
   // visual window where the new message sits below the fold while we wait
   // for the ResizeObserver / scroll event chain to fire and re-pin.
+  //
+  // We pin TWICE in this critical path — once synchronously, then once on
+  // the next rAF. The second pin catches the case where React mounts the
+  // new message in the second commit (after our layout effect ran), which
+  // grows scrollHeight again; without the rAF pin the user briefly sees a
+  // ~15 px gap below the new message until the RO catches up. Streaming
+  // tokens use the rate-limited RO path only; only the group-count change
+  // (which fires once per user submit / new turn arrival) pays for the
+  // extra pin.
   const prevGroupCountForLayoutRef = useRef(groupCount)
   useLayoutEffect(() => {
     if (!enabled) {
@@ -373,6 +369,11 @@ function useThreadScrollAnchor({ enabled, groupCount, scrollerRef, sessionKey, v
     }
     if (groupCount > prevGroupCountForLayoutRef.current && armedRef.current) {
       pinToBottom()
+      requestAnimationFrame(() => {
+        if (armedRef.current) {
+          pinToBottom()
+        }
+      })
     }
     prevGroupCountForLayoutRef.current = groupCount
   }, [enabled, groupCount, pinToBottom])
