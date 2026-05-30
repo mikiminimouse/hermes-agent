@@ -4,7 +4,7 @@ Native Electron shell for Hermes. It packages the desktop renderer, a bundled He
 
 ## Setup
 
-Install workspace dependencies from the repo root so `apps/desktop`, `apps/dashboard`, and `apps/shared` stay linked:
+Install workspace dependencies from the repo root so `apps/desktop`, `web`, and `apps/shared` stay linked:
 
 ```bash
 npm install
@@ -80,7 +80,7 @@ hermes dashboard --tui --no-open
 For dashboard HMR, start Vite in another terminal:
 
 ```bash
-cd apps/dashboard
+cd web
 npm run dev
 ```
 

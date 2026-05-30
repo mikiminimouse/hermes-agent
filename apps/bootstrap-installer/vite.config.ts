@@ -6,7 +6,7 @@ import path from 'node:path'
 // Hermes Setup — Tauri-targeted Vite config.
 //
 // Port 5175 keeps us out of the way of:
-//   apps/dashboard       (vite default 5173)
+//   web       (vite default 5173)
 //   apps/desktop dev     (5174 per its package.json)
 //
 // `clearScreen: false` is the Tauri convention — they spawn vite as a child

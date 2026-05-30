@@ -20,8 +20,6 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     MessageEvent,
     MessageType,
-    SendResult,
-    SUPPORTED_DOCUMENT_TYPES,
     is_host_excluded_by_no_proxy,
 )
 
