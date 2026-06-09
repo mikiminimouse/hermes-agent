@@ -4,3 +4,6 @@ dist/
 *.frame.txt
 *.ansi
 bun.lockb
+
+# the global ~/.gitignore_global `lib/` rule swallows our test harness — re-include it
+!src/test/lib/
