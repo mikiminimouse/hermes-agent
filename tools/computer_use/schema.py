@@ -59,6 +59,7 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                     "wait",
                     "list_apps",
                     "focus_app",
+                    "switch_desktop",
                 ],
                 "description": (
                     "Which action to perform. `capture` is free (no side "
@@ -206,6 +207,16 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                     "window to front (DISRUPTS the user). Default false "
                     "— input is routed to the app without raising, "
                     "matching the background co-work model."
+                ),
+            },
+            # ── switch_desktop ──────────────────────────────────────
+            "direction": {
+                "type": "string",
+                "enum": ["left", "right"],
+                "description": (
+                    "Only for action='switch_desktop'. Switches to the "
+                    "adjacent virtual desktop. Requires Windows 10+ with "
+                    "multiple virtual desktops."
                 ),
             },
             # ── return shape ───────────────────────────────────────

@@ -426,6 +426,13 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
         res = backend.set_value(value=str(value), element=args.get("element"))
         return _maybe_follow_capture(backend, res, capture_after)
 
+    if action == "switch_desktop":
+        direction = args.get("direction", "")
+        if not hasattr(backend, "switch_desktop"):
+            return json.dumps({"error": "switch_desktop not supported by current backend"})
+        res = backend.switch_desktop(str(direction))
+        return json.dumps({"ok": res.ok, "message": res.message})
+
     return json.dumps({"error": f"unknown action {action!r}"})
 
 

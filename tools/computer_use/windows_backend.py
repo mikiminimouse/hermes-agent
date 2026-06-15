@@ -295,6 +295,50 @@ def _press_combo(vks: List[int]) -> None:
     _send_inputs(seq)
 
 
+def _switch_desktop_via_keybd(direction: str, overlay_client) -> bool:
+    """Switch virtual desktop, keeping the overlay alive across the transition.
+
+    Any SendInput-based virtual-desktop switch kills the full-screen tkinter
+    overlay subprocess because the display-context change tears down its X11
+    connection.  Workaround: stop the overlay → switch → restart it on the
+    new desktop.
+    """
+    VK_CONTROL = 0x11
+    VK_LWIN = 0x5B
+    VK_LEFT = 0x25
+    VK_RIGHT = 0x27
+
+    vk_dir = VK_LEFT if direction == "left" else VK_RIGHT
+
+    press = [_key_event(VK_CONTROL, True),
+             _key_event(VK_LWIN, True),
+             _key_event(vk_dir, True)]
+    release = [_key_event(vk_dir, False),
+               _key_event(VK_LWIN, False),
+               _key_event(VK_CONTROL, False)]
+
+    try:
+        # 1. Gracefully stop the overlay before switching
+        overlay_client.stop()
+
+        # 2. Switch virtual desktop
+        _send_inputs(press)
+        time.sleep(0.08)
+        _send_inputs(release)
+
+        # 3. Restart overlay on the new desktop
+        overlay_client._dead = False  # we killed it on purpose, not a crash
+        overlay_client.start()
+        return True
+    except Exception:
+        try:
+            overlay_client._dead = False
+            overlay_client.start()
+        except Exception:
+            pass
+        return False
+
+
 def _type_unicode(text: str) -> None:
     """Type text via KEYEVENTF_UNICODE; newlines become Return taps."""
     batch: List[_INPUT] = []
@@ -989,6 +1033,23 @@ class WindowsUIABackend(ComputerUseBackend):
             return ActionResult(ok=True, action="key", message=f"pressed {keys}")
         except Exception as e:
             return ActionResult(ok=False, action="key", message=f"key failed: {e}")
+
+    def switch_desktop(self, direction: str) -> ActionResult:
+        """Switch to adjacent virtual desktop.
+
+        Temporarily stops the overlay subprocess before switching and
+        restarts it on the new desktop, because any SendInput-based
+        virtual-desktop transition kills the full-screen tkinter window.
+        """
+        if direction not in ("left", "right"):
+            return ActionResult(ok=False, action="switch_desktop",
+                                message=f"unknown direction {direction!r}")
+        self._overlay.send({"cmd": "flash", "text": f"switch desktop · {direction}", "ttl": 1.0})
+        ok = _switch_desktop_via_keybd(direction, self._overlay)
+        return ActionResult(
+            ok=ok, action="switch_desktop",
+            message=(f"switched to {direction} virtual desktop"
+                     if ok else "virtual desktop switch failed"))
 
     # ── Native-value mutation ───────────────────────────────────────
     def set_value(self, value: str, element: Optional[int] = None) -> ActionResult:
