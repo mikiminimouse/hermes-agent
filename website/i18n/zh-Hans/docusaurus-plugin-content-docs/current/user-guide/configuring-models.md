@@ -208,30 +208,30 @@ hermes model            # 交互式提供商 + 模型选择器（切换默认值
 
 ```bash
 # 列出已认证的提供商及精选模型列表
-curl -H "X-Hermes-Session-Token: $TOKEN" http://localhost:PORT/api/model/options
+curl http://localhost:PORT/api/model/options
 
 # 读取当前主模型及辅助任务分配
-curl -H "X-Hermes-Session-Token: $TOKEN" http://localhost:PORT/api/model/auxiliary
+curl http://localhost:PORT/api/model/auxiliary
 
 # 设置主模型
-curl -X POST -H "Content-Type: application/json" -H "X-Hermes-Session-Token: $TOKEN" \
+curl -X POST -H "Content-Type: application/json" \
   -d '{"scope":"main","provider":"openrouter","model":"anthropic/claude-opus-4.7"}' \
   http://localhost:PORT/api/model/set
 
 # 覆盖单个辅助任务
-curl -X POST -H "Content-Type: application/json" -H "X-Hermes-Session-Token: $TOKEN" \
+curl -X POST -H "Content-Type: application/json" \
   -d '{"scope":"auxiliary","task":"vision","provider":"openrouter","model":"google/gemini-2.5-flash"}' \
   http://localhost:PORT/api/model/set
 
 # 将一个模型分配给所有辅助任务
-curl -X POST -H "Content-Type: application/json" -H "X-Hermes-Session-Token: $TOKEN" \
+curl -X POST -H "Content-Type: application/json" \
   -d '{"scope":"auxiliary","task":"","provider":"openrouter","model":"google/gemini-2.5-flash"}' \
   http://localhost:PORT/api/model/set
 
 # 将所有辅助任务重置为 auto
-curl -X POST -H "Content-Type: application/json" -H "X-Hermes-Session-Token: $TOKEN" \
+curl -X POST -H "Content-Type: application/json" \
   -d '{"scope":"auxiliary","task":"__reset__","provider":"","model":""}' \
   http://localhost:PORT/api/model/set
 ```
 
-session token 在启动时注入仪表板 HTML，每次服务器重启后轮换。如需对运行中的仪表板编写脚本，可从浏览器开发者工具中获取（`window.__HERMES_SESSION_TOKEN__`）。
+本地（回环）仪表板无需任何认证即可编写脚本——上面的 curl 调用直接针对 `127.0.0.1` 即可工作。如需对受保护的（远程 / 非回环）仪表板编写脚本，请使用浏览器登录时获得的会话 cookie（与浏览器使用的同一个）进行认证；不再有可供获取的静态 token。

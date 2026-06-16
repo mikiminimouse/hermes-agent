@@ -467,7 +467,7 @@ GUI 严格是一个**通过 DB 读取 + 通过 kanban_db 写入**的层，没有
 
 ### REST 接口
 
-所有路由挂载在 `/api/plugins/kanban/` 下，并受仪表盘的临时会话 token 保护：
+所有路由挂载在 `/api/plugins/kanban/` 下。在回环仪表盘上，它们无需任何凭据——回环绑定就是安全边界。在受保护的（非回环）仪表盘上，它们与其他所有 `/api/` 路由一样，由会话 cookie 进行认证：
 
 | 方法 | 路径 | 用途 |
 |---|---|---|
@@ -511,7 +511,7 @@ dashboard:
 
 仪表盘的 HTTP 认证中间件[显式跳过 `/api/plugins/`](./extending-the-dashboard#backend-api-routes) —— 插件路由在设计上是未认证的，因为仪表盘默认绑定到 localhost。这意味着 kanban REST 接口可以从主机上的任何进程访问。
 
-WebSocket 额外增加了一步：它要求仪表盘的临时会话 token 作为 `?token=…` 查询参数（浏览器无法在升级请求上设置 `Authorization`），与浏览器内 PTY 桥使用的模式一致。
+WebSocket 遵循同样的模型：在回环仪表盘上无需任何凭据；在受保护的仪表盘上，它使用一次性的 `?ticket=…` 查询参数（通过 `/api/auth/ws-ticket` 签发），因为浏览器无法在升级请求上设置 `Authorization`——这与浏览器内 PTY 桥使用的模式一致。
 
 如果你运行 `hermes dashboard --host 0.0.0.0`，每个插件路由 —— 包括 kanban —— 都可以从网络访问。**不要在共享主机上这样做。** 看板包含任务正文、评论和工作区路径；攻击者访问这些路由可以读取你整个协作界面，还可以创建 / 重新分配 / 归档任务。
 

@@ -111,7 +111,7 @@ The **Chat** tab embeds the full Hermes TUI (the same interface you get from `he
 
 **How it works:**
 
-- `/api/pty` opens a WebSocket authenticated with the dashboard's session token
+- `/api/pty` opens a WebSocket — on a loopback dashboard it needs no credential; on a gated dashboard it authenticates with a single-use ticket
 - The server spawns `hermes --tui` behind a POSIX pseudo-terminal
 - Keystrokes travel to the PTY; ANSI output streams back to the browser
 - xterm.js's WebGL renderer paints each cell to an integer-pixel grid; mouse tracking (SGR 1006), wide characters (Unicode 11), and box-drawing glyphs all render natively
@@ -380,7 +380,7 @@ Creating a shell hook (note the consent checkbox and the run-arbitrary-commands 
 ![New shell hook modal](/img/dashboard/admin-hook-create.png)
 
 :::warning Security
-The web dashboard reads and writes your `.env` file, which contains API keys and secrets. It binds to `127.0.0.1` by default — only accessible from your local machine. If you bind to `0.0.0.0`, anyone on your network can view and modify your credentials. The dashboard has no authentication of its own.
+The web dashboard reads and writes your `.env` file, which contains API keys and secrets. It binds to `127.0.0.1` by default — only accessible from your local machine. If you bind to `0.0.0.0`, anyone on your network can view and modify your credentials. On a loopback bind there is no identity gate: the loopback bind itself is the security boundary, backed by a `Sec-Fetch-Site` CSRF guard that blocks cross-origin mutating requests and a localhost-only CORS policy that blocks cross-origin reads. To expose the dashboard beyond your machine, bind to a non-loopback address (which engages the [auth gate](#authentication-gated-mode)) rather than relying on loopback.
 :::
 
 ## `/reload` Slash Command

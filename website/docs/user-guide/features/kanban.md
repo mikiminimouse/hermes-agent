@@ -571,7 +571,7 @@ The GUI is strictly a **read-through-the-DB + write-through-kanban_db** layer wi
 
 ### REST surface
 
-All routes are mounted under `/api/plugins/kanban/` and protected by the dashboard's ephemeral session token:
+All routes are mounted under `/api/plugins/kanban/`. On a loopback dashboard they require no credential — the loopback bind is the security boundary. On a gated (non-loopback) dashboard they're authenticated by the session cookie, like every other `/api/` route:
 
 | Method | Path | Purpose |
 |---|---|---|
@@ -615,7 +615,7 @@ Each key is optional and falls back to the shown default.
 
 The dashboard's HTTP auth middleware [explicitly skips `/api/plugins/`](./extending-the-dashboard#backend-api-routes) — plugin routes are unauthenticated by design because the dashboard binds to localhost by default. That means the kanban REST surface is reachable from any process on the host.
 
-The WebSocket takes one additional step: it requires the dashboard's ephemeral session token as a `?token=…` query parameter (browsers can't set `Authorization` on an upgrade request), matching the pattern used by the in-browser PTY bridge.
+The WebSocket follows the same model: on a loopback dashboard it needs no credential, and on a gated dashboard it uses a single-use `?ticket=…` query parameter (minted via `/api/auth/ws-ticket`) because browsers can't set `Authorization` on an upgrade request — matching the pattern used by the in-browser PTY bridge.
 
 If you run `hermes dashboard --host 0.0.0.0`, every plugin route — kanban included — becomes reachable from the network. **Don't do that on a shared host.** The board contains task bodies, comments, and workspace paths; an attacker reaching these routes gets read access to your entire collaboration surface and can also create / reassign / archive tasks.
 

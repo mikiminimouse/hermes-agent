@@ -727,7 +727,7 @@ async def do_action(body: dict):
 - `GET  /api/plugins/my-plugin/data`
 - `POST /api/plugins/my-plugin/action`
 
-插件 API 路由绕过会话 token 认证，因为 dashboard 服务器默认绑定到 localhost。**如果运行不受信任的插件，请勿使用 `--host 0.0.0.0` 将 dashboard 暴露在公共接口上**——其路由也会变得可访问。
+插件 API 路由在回环绑定上无需任何身份验证——回环绑定就是安全边界。**如果运行不受信任的插件，请勿使用 `--host 0.0.0.0` 将 dashboard 暴露在公共接口上**——其路由也会变得可访问。
 
 #### 访问 Hermes 内部模块
 
