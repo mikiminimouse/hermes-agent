@@ -11,8 +11,11 @@ from __future__ import annotations
 
 from enum import Enum
 
-# Frame geometry (pixels).  A standard petdex spritesheet is a 1536×1872 grid
-# → 8 columns × 9 rows of these frames.
+# Frame geometry (pixels).  Per the petdex package format a spritesheet is an
+# 8-row × 9-column grid of these frames (1728×1664 px): one state per row (see
+# ``STATE_ROWS``), frames stepping left→right across the 9 columns.  We only
+# read ``FRAMES_PER_STATE`` (6) of each row; renderers derive the real column
+# count from the sheet width, so sheets with a different column count still work.
 FRAME_W = 192
 FRAME_H = 208
 
@@ -33,6 +36,17 @@ LOOP_MS = 1100
 # fallback can't shrink as far — see ``UNICODE_MIN_COLS`` — and clamps to its
 # legibility floor instead.)
 DEFAULT_SCALE = 0.33
+
+# User-settable scale bounds (``/pet scale``, desktop slider).  Floor keeps the
+# pet clickable/visible; ceiling stops a fat-fingered value from filling the
+# screen.  The unicode fallback additionally clamps to ``UNICODE_MIN_COLS``.
+MIN_SCALE = 0.1
+MAX_SCALE = 3.0
+
+
+def clamp_scale(scale: float) -> float:
+    """Clamp *scale* to ``[MIN_SCALE, MAX_SCALE]`` (the single validation point)."""
+    return max(MIN_SCALE, min(MAX_SCALE, scale))
 
 # Terminal cells one native frame spans at ``scale == 1.0``.  A cell is ~8px
 # wide, a frame is ``FRAME_W`` (192) px → 24 cells.  This mirrors the kitty
