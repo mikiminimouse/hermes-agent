@@ -4471,6 +4471,16 @@ async function teardownSshConnection(profile) {
   const state = sshConnections.get(scope)
   if (!state) return
   sshConnections.delete(scope)
+  // Dispose any interim ssh -tt terminals riding this scope's master FIRST —
+  // once the master closes a leftover PTY is pointed at a dead control socket.
+  // Spec component 4 invariant: a connection flip tears down terminal sessions
+  // on the connection (mirrors desktop-remote-terminal.md). Local/other-scope
+  // terminals are untagged or tagged with a different scope and are left alone.
+  for (const [id, info] of [...terminalSessions.entries()]) {
+    if (info.sshScope === scope) {
+      disposeTerminalSession(id)
+    }
+  }
   try {
     if (state.localPort && state.remotePort) {
       await state.ssh.cancelForward(state.localPort, state.remotePort)
@@ -4489,16 +4499,19 @@ async function teardownSshConnection(profile) {
 // null when the active connection is not SSH. Used by the interim ssh -tt
 // terminal so a remote terminal lands on the SSH host — and ONLY in SSH mode
 // (it must never leak into token/oauth remotes, whose trust boundary is a
-// token/cookie, not a shell credential).
+// token/cookie, not a shell credential). Returns { ssh, scope } so the spawned
+// terminal can be tagged with its backing scope and disposed on a flip.
 function activeSshTerminalTarget() {
-  const scope = sshScopeKey(primaryProfileKey())
+  const primaryScope = sshScopeKey(primaryProfileKey())
   // Try the primary scope first, then the global scope (one of them backs the
   // window depending on whether a per-profile SSH override is in play).
-  const state = sshConnections.get(scope) || sshConnections.get('')
-  if (!state || !state.ssh) {
-    return null
+  for (const scope of [primaryScope, '']) {
+    const state = sshConnections.get(scope)
+    if (state && state.ssh) {
+      return { ssh: state.ssh, scope }
+    }
   }
-  return state.ssh
+  return null
 }
 
 // Bring up (or reuse) the SSH-tunneled dashboard for one scope and return a
@@ -6438,7 +6451,7 @@ ipcMain.handle('hermes:terminal:start', async (event, payload = {}) => {
   const sshTarget = activeSshTerminalTarget()
   if (sshTarget) {
     const remoteCwd = String(payload?.cwd || '').trim()
-    const sshArgs = buildInteractiveSshArgs(sshTarget, remoteCwd)
+    const sshArgs = buildInteractiveSshArgs(sshTarget.ssh, remoteCwd)
     const sshPty = nodePty.spawn('ssh', sshArgs, {
       cols,
       cwd: app.getPath('home'),
@@ -6447,7 +6460,10 @@ ipcMain.handle('hermes:terminal:start', async (event, payload = {}) => {
       rows
     })
 
-    terminalSessions.set(id, { pty: sshPty, webContentsId: event.sender.id })
+    // Tag the session with its backing SSH scope so a connection flip can
+    // dispose the PTYs riding the master it tears down (the master goes away;
+    // a leftover ssh -tt would be pointed at a dead socket).
+    terminalSessions.set(id, { pty: sshPty, webContentsId: event.sender.id, sshScope: sshTarget.scope })
 
     const sshSend = (suffix, data) => {
       if (event.sender.isDestroyed()) {
