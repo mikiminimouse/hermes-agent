@@ -12,8 +12,20 @@ import type { TreeNode } from './use-project-tree'
 
 const ROW_HEIGHT = 22
 const INDENT = 10
-/** Base inset for every row; react-arborist owns paddingLeft for depth indent. */
-const TREE_ROW_INSET = 12
+/** Fixed base inset (`px-6.5`) layered on top of arborist's depth indent. */
+const TREE_ROW_INSET = '17px'
+
+function withTreeInset(paddingLeft: number | string | undefined): string {
+  if (typeof paddingLeft === 'number') {
+    return `calc(${paddingLeft}px + ${TREE_ROW_INSET})`
+  }
+
+  if (!paddingLeft) {
+    return TREE_ROW_INSET
+  }
+
+  return `calc(${paddingLeft} + ${TREE_ROW_INSET})`
+}
 
 interface ProjectTreeProps {
   collapseNonce: number
@@ -204,10 +216,7 @@ function ProjectTreeRow({
       ref={dragHandle}
       style={{
         ...style,
-        paddingLeft:
-          (typeof style.paddingLeft === 'number'
-            ? style.paddingLeft
-            : Number.parseFloat(String(style.paddingLeft ?? 0)) || 0) + TREE_ROW_INSET
+        paddingLeft: withTreeInset(style.paddingLeft)
       }}
     >
       {/* No chevron column — the folder icon (open/closed) already carries the

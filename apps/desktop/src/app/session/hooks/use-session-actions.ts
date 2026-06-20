@@ -13,6 +13,7 @@ import { $pinnedSessionIds } from '@/store/layout'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { requestDesktopOnboarding } from '@/store/onboarding'
 import { $activeGatewayProfile, $newChatProfile, $profiles, ensureGatewayProfile, normalizeProfileKey } from '@/store/profile'
+import { tombstoneSessions, untombstoneSessions } from '@/store/projects'
 import {
   $currentCwd,
   $currentFastMode,
@@ -188,7 +189,10 @@ function upsertOptimisticSession(
   const profileKey = normalizeProfileKey($activeGatewayProfile.get())
 
   const session: SessionInfo = {
-    cwd: created.info?.cwd ?? null,
+    // Seed cwd so the grouped sidebar can place the new row in its repo/worktree
+    // lane immediately (the overlay groups by path); fall back to the workspace
+    // the session was just started in when the create response omits it.
+    cwd: created.info?.cwd ?? ($currentCwd.get().trim() || null),
     ended_at: null,
     id,
     input_tokens: 0,
@@ -971,6 +975,10 @@ export function useSessionActions({
       const removedPinId = removed ? sessionPinId(removed) : storedSessionId
 
       setSessions(prev => prev.filter(session => !sessionMatchesStoredId(session, storedSessionId)))
+      // Evict from the project tree's optimistic layer too (the backend snapshot
+      // still lists it until its next refresh), so grouped + flat views drop the
+      // row in lockstep.
+      tombstoneSessions([storedSessionId, removed?.id, removed?._lineage_root_id])
       // Keep $sessionsTotal in sync so the sidebar's "Load N more" footer
       // doesn't keep claiming the removed row is still on the server.
       setSessionsTotal(prev => Math.max(0, prev - 1))
@@ -999,6 +1007,7 @@ export function useSessionActions({
           setSessionsTotal(prev => prev + 1)
         }
 
+        untombstoneSessions([storedSessionId, removed?.id, removed?._lineage_root_id])
         $pinnedSessionIds.set(previousPinned)
 
         if (wasSelected) {
@@ -1053,6 +1062,7 @@ export function useSessionActions({
 
       // Soft-hide: drop from the sidebar immediately, keep the data.
       setSessions(prev => prev.filter(session => !sessionMatchesStoredId(session, storedSessionId)))
+      tombstoneSessions([storedSessionId, archived?.id, archived?._lineage_root_id])
       // Archived sessions are hidden by the listSessions(min_messages=1) query
       // on the next refresh, so they count as "removed" for the load-more
       // footer math.
@@ -1078,6 +1088,7 @@ export function useSessionActions({
           setSessionsTotal(prev => prev + 1)
         }
 
+        untombstoneSessions([storedSessionId, archived?.id, archived?._lineage_root_id])
         $pinnedSessionIds.set(previousPinned)
         notifyError(err, copy.archiveFailed)
       }

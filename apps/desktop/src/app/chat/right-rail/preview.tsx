@@ -7,6 +7,7 @@ import { Tip } from '@/components/ui/tooltip'
 import { translateNow, useI18n } from '@/i18n'
 import { cn } from '@/lib/utils'
 import {
+  $panesFlipped,
   $rightRailActiveTabId,
   RIGHT_RAIL_PREVIEW_TAB_ID,
   type RightRailTabId,
@@ -56,6 +57,7 @@ export function ChatPreviewRail({ onRestartServer, setTitlebarToolGroup }: ChatP
   const { t } = useI18n()
   const previewReloadRequest = useStore($previewReloadRequest)
   const activeTabId = useStore($rightRailActiveTabId)
+  const panesFlipped = useStore($panesFlipped)
   const filePreviewTabs = useStore($filePreviewTabs)
   const previewTarget = useStore($previewTarget)
 
@@ -82,7 +84,12 @@ export function ChatPreviewRail({ onRestartServer, setTitlebarToolGroup }: ChatP
   const isPreview = activeTab.id === RIGHT_RAIL_PREVIEW_TAB_ID
 
   return (
-    <aside className="relative flex h-full w-full min-w-0 flex-col overflow-hidden border-l border-(--ui-stroke-tertiary) bg-(--ui-editor-surface-background) text-(--ui-text-tertiary)">
+    <aside
+      className={cn(
+        'relative flex h-full w-full min-w-0 flex-col overflow-hidden border-(--ui-stroke-tertiary) bg-(--ui-editor-surface-background) text-(--ui-text-tertiary)',
+        panesFlipped ? 'border-r' : 'border-l'
+      )}
+    >
       <div className="group/rail-tabs flex h-(--titlebar-height) shrink-0 border-b border-(--ui-stroke-tertiary) bg-(--ui-sidebar-surface-background)">
         <div
           className="flex min-w-0 flex-1 overflow-x-auto overflow-y-hidden overscroll-x-contain [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"

@@ -465,9 +465,9 @@ export function DesktopController() {
     void refreshMessagingSessions()
   }, [profileScope, refreshCronSessions, refreshCronJobs, refreshMessagingSessions])
 
-  const loadMoreSessions = useCallback(() => {
+  const loadMoreSessions = useCallback(async () => {
     bumpSessionsLimit()
-    void refreshSessions()
+    await refreshSessions()
   }, [refreshSessions])
 
   // Another window mutated the shared session list (e.g. a chat started in the
