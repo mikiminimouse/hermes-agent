@@ -270,15 +270,20 @@ display:
 
 The self-improvement review is a forked agent that replays your recent
 conversation and decides whether to save a memory or patch a skill. By default
-it runs on your **main chat model** so it can reuse that conversation's warmed
-prompt cache. On a cheap main model that's the cheapest option; on an expensive
-reasoning model (e.g. a frontier GPT/Claude tier) every review pays full price
-for the replayed transcript, which adds up over a long session.
+it runs on your **main chat model** and replays the full conversation — which is
+already warm in the prompt cache, so those tokens are cheap **cache reads**. On
+an expensive reasoning model the review still adds up over a long session.
 
-Three knobs keep the review cheap without weakening what it learns:
+A key cache fact shapes what actually saves money here: trimming the replayed
+history on your **main model does NOT help** — the full history is a cheap warm
+cache read, whereas a trimmed "digest" is a *new* prefix the cache has never
+seen, billed as cache **writes** (~12.5× the read price). So digesting a normal
+session on the main model costs *more*, not less.
 
-**Route the review to a cheap model.** Point it at a fast, inexpensive model —
-the same per-task plumbing every auxiliary task uses:
+What genuinely reduces cost:
+
+**Route the review to a cheap model** (the real lever). Point it at a fast,
+inexpensive model — same per-task plumbing every auxiliary task uses:
 
 ```yaml
 auxiliary:
@@ -287,14 +292,14 @@ auxiliary:
     model: google/gemini-3-flash-preview   # auto (default) = use the main chat model
 ```
 
-When routed to a model other than your main one, the prompt-cache share is
-dropped (it would miss anyway) and the fork replays a trimmed context **digest**
-(recent turns verbatim + a summary of older ones) instead of the full
-transcript. In our A/B this cut per-review cost by roughly an order of magnitude
-with no measured loss in what the review correctly saved.
+A different model can't reuse your main model's cache anyway, so the review is
+"cold" regardless — which means trimming the replay to a digest is free here,
+and the saving is the cheaper model. In our benchmarks this ran **~3–5× cheaper
+per review** with quality holding: memory capture identical, skill capture
+near-identical, and *fewer* false-saves than the expensive main model.
 
-**Bound the replayed context.** Even on the main model, a very large session is
-capped so a runaway transcript can't drive a huge review bill:
+**Bound the replayed context** (a safety net, not an optimizer). A pathological
+runaway session is capped so it can't drive a huge review bill:
 
 ```yaml
 auxiliary:

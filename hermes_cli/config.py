@@ -1531,14 +1531,15 @@ DEFAULT_CONFIG = {
         },
         # Background review — the post-turn self-improvement fork that decides
         # whether to save a memory / patch a skill. "auto" = use the main chat
-        # model (the historical default; it reuses the parent's warmed
-        # system-prompt prefix cache, see PR #17276). Override to a cheap fast
-        # model (e.g. openrouter google/gemini-3-flash-preview) to cut the cost
-        # of this fork by ~10-30x on expensive main models. NOTE: when routed
-        # to a model OTHER than the parent's, the parent prefix-cache share is
-        # disabled (different cache key) and the fork replays a trimmed context
-        # digest instead of the full transcript — quality holds for the
-        # memory/skill filing task.
+        # model (the historical default; it replays the conversation, which is
+        # already WARM in the prompt cache, as cheap cache reads). Override to a
+        # cheap fast model (e.g. openrouter google/gemini-3-flash-preview) to
+        # cut the cost of this fork by ~3-5x on expensive main models — the
+        # genuine cost lever. When routed to a model OTHER than the parent's,
+        # the parent prefix-cache is unusable anyway (different model), so the
+        # fork replays a trimmed digest instead of the full transcript and
+        # quality holds for the memory/skill filing task (memory capture
+        # identical, skill near-identical in benchmarks). See PR #49252.
         "background_review": {
             "provider": "auto",
             "model": "",
@@ -1551,7 +1552,10 @@ DEFAULT_CONFIG = {
             # tail verbatim + a summary of older turns) instead of the full
             # transcript, bounding the pathological large-session case where an
             # uncompressed snapshot drove ~296K input tokens in one incident.
-            # 0 disables the guard (always replay full snapshot).
+            # This is a RUNAWAY-COST BOUND, not a routine optimizer: on the main
+            # model a digest is a novel cache-WRITE prefix (~12.5x the read
+            # price), so digesting a normal warm-cached session COSTS MORE. Keep
+            # the ceiling high; do NOT lower it to "save money". 0 disables.
             "max_context_tokens": 48000,
             # Verbatim tail size (messages) always kept when the digest path
             # engages — the turn(s) that triggered the review must survive

@@ -1052,13 +1052,24 @@ def _run_review_in_thread(
             )
             try:
                 # Build the conversation history to replay into the fork.
-                # - Routed to an aux model: the prefix-cache share is already
-                #   gone, so trimming to a digest is pure cost win.
+                #
+                # CACHE NOTE (load-bearing — see PR #49252 correction): on the
+                # MAIN model the parent conversation is already WARM in the
+                # prompt cache, so replaying the full history bills as cheap
+                # cache READS. A digest is a NOVEL prefix the cache has never
+                # seen, so it bills as cache WRITES (~12.5x the read price).
+                # Trimming history on the main model therefore COSTS MORE, not
+                # less — it is NOT a cost optimization. So:
+                # - Routed to an aux model: the parent cache is unusable by a
+                #   different model anyway (cold prefix regardless), so trimming
+                #   to a digest is a genuine win — fewer cold tokens to write.
                 # - Not routed (main-model path): keep the full snapshot so the
-                #   message-level prefix cache still hits — UNLESS the snapshot
-                #   blows past the hard token ceiling, in which case we digest
-                #   anyway to bound the pathological large-session case (the
-                #   ~296K-token incident this PR addresses). 0 disables.
+                #   warm-cache reads still hit. Digest ONLY when the snapshot
+                #   blows past the hard token ceiling — there the digest is a
+                #   runaway-cost BOUND (capping the ~296K-token bleed), accepted
+                #   as the lesser evil, not a routine saver. Do NOT lower the
+                #   ceiling to "save money" on normal sessions; it backfires.
+                #   0 disables the guard entirely.
                 _budget = _read_review_budget()
                 _max_ctx = _budget["max_context_tokens"]
                 _full_tokens = _rough_token_count(messages_snapshot)
