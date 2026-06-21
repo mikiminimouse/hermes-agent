@@ -5,16 +5,32 @@ brain→Silero TTS→virtual mic). Default voice **eugene** (Silero). Transcribe
 gates A–F pass. ~20 commits live on branch `meet/locale-receive-only` (NOT yet
 durable in prod — see P0).
 
-## P0 — Durable deployment (blocks everything) — PRE-FORK FIXES ✅ DONE
+## P0 — Durable deployment (blocks everything) — FORK ✅ DONE
 - [x] **3 blocking issues identified & fixed (commit 2033ca6b4):**
   - Fix #1: Debug output gated under `HERMES_MEET_DEBUG_MODE` → no JSON pollution in prod stdout
   - Fix #2: TTS env vars (HERMES_MEET_TTS, HERMES_MEET_PIPER_*, HERMES_MEET_SILERO_*) added to process_manager passthrough → Piper/Silero work in clean containers
   - Fix #3: Cached `mode` variable used consistently (lines 847, 1516) → atomic realtime/transcribe decision
-- [ ] Create fork `NousResearch/hermes-agent` → set fork as `origin` (carry our
-  delta on fork main), `upstream`=NousResearch. The updater already compares
-  origin vs upstream — built for this layout. Then `reset --hard origin/main`
-  restores OUR code.
-- [ ] Verify post-fork: `git log origin/main` shows our commits (2033ca6b4 + 23 prior)
+- [x] **Fork created `mikiminimouse/hermes-agent` (2026-06-21).** `origin`=fork
+  (SSH `git@github.com:mikiminimouse/hermes-agent.git`), `upstream`=NousResearch.
+  NOTE: forked under **mikiminimouse**, NOT skullbv — the machine SSH key
+  (`my_key`) belongs to mikiminimouse, so push works without collaborator setup.
+  gh API token was re-authed via `gh auth login -p ssh -w` (old token was 401).
+- [x] **Branch `meet/locale-receive-only` pushed: 30 commits ahead of
+  upstream/main, HEAD `0c0d5ca6c`.** Verified local==origin HEAD match.
+- [x] **PROD apply DONE (2026-06-21).** verter `~/.hermes/hermes-agent` IS the
+  same `.git` as the meetlab worktree (shared config), so `origin`=mikiminimouse
+  fork applied to prod automatically. Merged `meet/locale-receive-only` into
+  `main` (merge commit `1756a54a1`, 70+100 tests green), force-pushed `origin/main`.
+  Durable verified: prod `pull --ff-only origin main` from 3051a1634 = clean FF;
+  upstream-sync `pull --ff-only upstream main` cleanly FAILS (origin/main diverged
+  via merge, no hard-reset fallback) → OUR code survives `hermes update`. Prod
+  pinned at 0.17.0 base + meet (no surprise +23 upstream jump). Backup tag
+  `prod-main-backup-20260621` → 3051a1634.
+- [x] **Summary env wired:** added to verter systemd drop-in `meet.conf`:
+  `HERMES_MEET_SUMMARY_CMD=.../run_summary.sh`, `HERMES_MEET_TTS=silero`,
+  `HERMES_MEET_SILERO_VOICE=eugene`. Empty-meeting auto-end is on by code default
+  (LEAVE_WHEN_ALONE=1, ALONE_TIMEOUT=90). daemon-reload + gateway restart applied;
+  env confirmed in MainPID, NRestarts=0, vexa untouched (containers Up 27h).
 
 ## P1 — Auto meeting-end → auto-summary  ✅ DONE (on branch)
 - [x] Empty-meeting detection: `_detect_alone()` (RU+EN copy + participant
