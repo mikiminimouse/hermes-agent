@@ -158,6 +158,7 @@ def start(
     # os.environ.copy() above, but we forward them explicitly so the bot's
     # browser-engine contract is visible at the spawn site and survives any
     # future change to how `env` is built. Unset => bot uses bundled Chromium.
+    # Default TTS backend is Silero (self-hosted, no API key).
     for _k in (
         "HERMES_MEET_CHROME_CHANNEL",
         "HERMES_MEET_CHROME_PATH",
@@ -175,6 +176,8 @@ def start(
         "HERMES_MEET_SILERO_RATE",
     ):
         _v = os.environ.get(_k)
+        if _k == "HERMES_MEET_TTS" and not _v:
+            _v = "silero"
         if _v:
             env[_k] = _v
 

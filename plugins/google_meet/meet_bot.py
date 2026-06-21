@@ -454,9 +454,9 @@ def _start_realtime_speaker(
         state.set(error=f"realtime import failed: {e}")
         return
 
-    # TTS backend selection. Default = OpenAI Realtime (original). "silero" uses
-    # a self-hosted, open-weights local voice (raw PCM, no transcode) — same
-    # downstream pump/sink/fake-mic chain.
+    # TTS backend selection. Default = Silero (self-hosted, open-weights local voice).
+    # Raw PCM, no transcode — same downstream pump/sink/fake-mic chain.
+    # Set HERMES_MEET_TTS=openai to use OpenAI Realtime instead.
     tts_backend = os.environ.get("HERMES_MEET_TTS", "").strip().lower()
 
     pcm_path = out_dir / SAY_PCM_FILENAME
@@ -706,11 +706,12 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
         "speaker_thread": None,    # threading.Thread | None
         "speaker_stop": None,      # callable | None
     }
-    # Self-hosted Silero TTS needs no API key; OpenAI Realtime does.
+    # The bot uses Silero TTS for realtime voice synthesis (no API key needed).
+    # Set HERMES_MEET_TTS=openai to switch to OpenAI Realtime (requires API key).
     _tts_backend = os.environ.get("HERMES_MEET_TTS", "").strip().lower()
     if rt["enabled"]:
-        if _tts_backend not in ("silero",) and not realtime_api_key:
-            state.set(error="realtime mode requested but no API key in HERMES_MEET_REALTIME_KEY/OPENAI_API_KEY — falling back to transcribe (or set HERMES_MEET_TTS=silero)")
+        if _tts_backend == "openai" and not realtime_api_key:
+            state.set(error="OpenAI realtime TTS requested but no API key in HERMES_MEET_REALTIME_KEY/OPENAI_API_KEY — falling back to transcribe mode")
             rt["enabled"] = False
         else:
             try:
