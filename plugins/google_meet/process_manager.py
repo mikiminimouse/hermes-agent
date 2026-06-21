@@ -162,6 +162,10 @@ def start(
         "HERMES_MEET_CHROME_CHANNEL",
         "HERMES_MEET_CHROME_PATH",
         "HERMES_MEET_USER_DATA_DIR",
+        "HERMES_MEET_PROXY",
+        "HERMES_MEET_NO_SANDBOX",
+        "HERMES_MEET_REQUIRE_AUTH",
+        "HERMES_MEET_CAPTION_LANG",
     ):
         _v = os.environ.get(_k)
         if _v:

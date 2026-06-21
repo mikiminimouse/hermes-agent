@@ -187,13 +187,19 @@ _CAPTION_OBSERVER_JS = r"""
   window.__hermesMeetInstalled = true;
   window.__hermesMeetQueue = [];
 
+  // The caption region's DOM node is recreated by Meet (when captions toggle,
+  // settings open/close, or speech starts), which orphans a MutationObserver
+  // bound to a single node. So we observe document.body and RE-QUERY the
+  // current caption region on every mutation — robust against node swaps.
   const captionSelector = '[role="region"][aria-label*="aption" i], ' +
-                          'div[jsname="dsyhDe"], ' +  // current (Jun 2026, verified)
-                          'div[jsname="YSxPC"], ' +   // legacy (dead)
-                          'div[jsname="tgaKEf"]';     // legacy (dead)
+                          'div[jsname="dsyhDe"]';  // current (Jun 2026, verified)
 
+  let lastKey = '';
   function pushEntry(speaker, text) {
     if (!text || !text.trim()) return;
+    const key = (speaker || '') + '\x1f' + text.trim();
+    if (key === lastKey) return;  // collapse consecutive identical scans
+    lastKey = key;
     window.__hermesMeetQueue.push({
       ts: Date.now(),
       speaker: (speaker || '').trim(),
@@ -201,40 +207,25 @@ _CAPTION_OBSERVER_JS = r"""
     });
   }
 
-  function scan(root) {
-    // Meet captions render as a list of rows; each row contains a speaker
-    // label and a text block. Selectors vary across Meet rewrites; we try
-    // a few shapes and fall back to raw text.
-    const rows = root.querySelectorAll('div[jsname="dsyhDe"], div.CNusmb, div.TBMuR');
-    if (rows.length) {
-      rows.forEach((row) => {
-        const spkEl = row.querySelector('div.KcIKyf, div.zs7s8d, span[jsname="YSxPC"]');
-        const txtEl = row.querySelector('div.bh44bd, span[jsname="tgaKEf"], div.iTTPOb');
-        const speaker = spkEl ? spkEl.innerText : '';
-        const text = txtEl ? txtEl.innerText : row.innerText;
-        pushEntry(speaker, text);
-      });
-      return;
-    }
-    // Fallback: treat the whole region's innerText as one anonymous line.
-    const text = (root.innerText || '').split('\n').filter(Boolean).pop();
-    pushEntry('', text);
+  function scan() {
+    const root = document.querySelector(captionSelector);
+    if (!root) return;
+    // Each caption row carries a speaker label then the spoken text. Old class
+    // selectors drift across Meet rewrites, so split the row/region innerText:
+    // line 1 = speaker, the rest = text. Falls back to the whole region.
+    const rows = root.querySelectorAll('div[jsname="dsyhDe"]');
+    const targets = (rows && rows.length) ? rows : [root];
+    targets.forEach((row) => {
+      const lines = (row.innerText || '').split('\n').map((s) => s.trim()).filter(Boolean);
+      if (!lines.length) return;
+      if (lines.length === 1) pushEntry('', lines[0]);
+      else pushEntry(lines[0], lines.slice(1).join(' '));
+    });
   }
 
-  function attach() {
-    const el = document.querySelector(captionSelector);
-    if (!el) return false;
-    const obs = new MutationObserver(() => scan(el));
-    obs.observe(el, { childList: true, subtree: true, characterData: true });
-    scan(el);
-    return true;
-  }
-
-  // Try now and retry on interval — the caption region only appears after
-  // captions are enabled and someone speaks.
-  if (!attach()) {
-    const iv = setInterval(() => { if (attach()) clearInterval(iv); }, 1500);
-  }
+  const obs = new MutationObserver(() => scan());
+  obs.observe(document.body, { childList: true, subtree: true, characterData: true });
+  scan();
 
   window.__hermesMeetDrain = () => {
     const out = window.__hermesMeetQueue.slice();
@@ -270,6 +261,64 @@ def _enable_captions_js() -> str:
       return false;
     })();
     """
+
+
+def _set_caption_language(page, lang: str) -> bool:
+    """Open caption settings and set the meeting/caption language.
+
+    Meet's live captions transcribe ONLY the configured language — there is no
+    auto-detect — so in transcribe mode the language must match the speakers or
+    the caption region stays empty. Opens Settings → Captions → "Language of
+    the meeting" and picks the first option whose label matches *lang*
+    (case-insensitive, e.g. "Russian" / "Русский"). Best-effort; returns True
+    only when an option was actually selected. Uses Playwright role locators
+    (combobox/option) rather than raw DOM clicks because the dropdown is a
+    custom listbox that renders options lazily.
+    """
+    try:
+        page.evaluate(
+            "()=>{const b=[...document.querySelectorAll('button')].find("
+            "x=>/open caption settings|caption settings|настройки субтитров/i"
+            ".test((x.innerText||'')+' '+(x.getAttribute('aria-label')||'')));"
+            "if(b)b.click()}"
+        )
+    except Exception:
+        return False
+    try:
+        page.wait_for_timeout(1500)
+    except Exception:
+        pass
+    rx = re.compile(lang, re.I)
+    opened = False
+    try:
+        page.get_by_role("combobox").first.click(timeout=3_000)
+        opened = True
+    except Exception:
+        try:
+            page.get_by_label(re.compile("language", re.I)).first.click(timeout=3_000)
+            opened = True
+        except Exception:
+            opened = False
+    if not opened:
+        return False
+    try:
+        page.wait_for_timeout(800)
+    except Exception:
+        pass
+    selected = False
+    try:
+        opt = page.get_by_role("option", name=rx).first
+        if opt.count():
+            opt.click(timeout=3_000)
+            selected = True
+    except Exception:
+        selected = False
+    # Close the settings dialog so it doesn't cover the caption region.
+    try:
+        page.keyboard.press("Escape")
+    except Exception:
+        pass
+    return selected
 
 
 def _start_realtime_speaker(
@@ -699,6 +748,8 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
             )
             last_admission_check = 0.0
             last_caption_enable = 0.0
+            caption_lang = os.environ.get("HERMES_MEET_CAPTION_LANG", "").strip()
+            caption_lang_done = False
             while not stop_flag["stop"]:
                 now = time.time()
                 if deadline and now > deadline:
@@ -748,6 +799,16 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
                         state.set(captions_enabled_attempted=True)
                     except Exception:
                         pass
+                    # Once captions are on, set the caption language (once) so
+                    # Meet transcribes the spoken language — otherwise the
+                    # default (often English) yields an empty transcript for
+                    # other languages. Env-gated; unset => leave Meet's default.
+                    if caption_lang and not caption_lang_done:
+                        try:
+                            if _set_caption_language(page, caption_lang):
+                                caption_lang_done = True
+                        except Exception:
+                            pass
 
                 try:
                     queued = page.evaluate("window.__hermesMeetDrain && window.__hermesMeetDrain()")
