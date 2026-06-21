@@ -494,22 +494,51 @@ def _start_realtime_speaker(
         import subprocess as _sp
 
         sink = (bridge_info or {}).get("write_target") or "hermes_meet_sink"
+        rate = getattr(session, "sample_rate", 24000)
         try:
+            # paplay reads stdin (no file arg) and a tailer thread streams the
+            # GROWING speaker.pcm into it. Passing the file path directly would
+            # make paplay read to EOF once and exit — but speaker.pcm starts
+            # empty and is appended to as TTS synthesizes, so paplay would quit
+            # before any audio existed (silent call). Tailing keeps it live.
             proc = _sp.Popen(
                 [
                     "paplay",
                     "--raw",
-                    f"--rate={getattr(session, 'sample_rate', 24000)}",
+                    f"--rate={rate}",
                     "--format=s16le",
                     "--channels=1",
                     f"--device={sink}",
-                    str(pcm_path),
                 ],
-                stdin=_sp.DEVNULL,
+                stdin=_sp.PIPE,
                 stdout=_sp.DEVNULL,
                 stderr=_sp.DEVNULL,
             )
             rt["pcm_pump"] = proc
+
+            def _pcm_tailer():
+                try:
+                    with open(pcm_path, "rb") as fh:
+                        while not stop_flag.get("stop"):
+                            chunk = fh.read(4096)
+                            if chunk:
+                                try:
+                                    proc.stdin.write(chunk)
+                                    proc.stdin.flush()
+                                except Exception:
+                                    break
+                            else:
+                                time.sleep(0.05)
+                except Exception:
+                    pass
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+
+            _tt = threading.Thread(target=_pcm_tailer, name="meet-pcm-tail", daemon=True)
+            _tt.start()
+            rt["pcm_tail"] = _tt
         except FileNotFoundError:
             state.set(error="paplay not found — install pulseaudio-utils for realtime on Linux")
     elif platform_tag == "darwin":
