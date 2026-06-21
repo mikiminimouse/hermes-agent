@@ -1112,6 +1112,7 @@ def test_detect_denied_is_bilingual():
 
     src = inspect.getsource(_detect_denied)
     assert "You can't join this video call" in src
+    assert "denied your request to join" in src  # live host-denial wording
     # Russian denial/removal wordings so RU denials aren't misread as timeouts.
     assert "не можете присоединиться" in src.lower()
     assert "удалил" in src.lower()

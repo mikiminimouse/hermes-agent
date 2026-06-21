@@ -1134,6 +1134,10 @@ def _detect_denied(page) -> bool:
     probe = r"""
     (() => {
       const text = document.body ? document.body.innerText || '' : '';
+      // Host denied the join request. The live wording is "Someone in the call
+      // denied your request to join" (captured), plus older variants.
+      if (/denied your request to join/i.test(text)) return true;
+      if (/отклонил[аи]? ваш запрос|отклонил[аи]? запрос на присоединение|ваш запрос (на присоединение )?отклон/i.test(text)) return true;
       // Denied / can't join.
       if (/You can't join this video call/i.test(text)) return true;
       if (/не можете присоединиться к (этой |этому )?(видео)?(встрече|звонку|конференции)/i.test(text)) return true;
