@@ -25,7 +25,7 @@ from typing import Optional
 _MODEL_CACHE: dict = {}
 
 # v4_ru speakers: aidar, baya, kseniya, xenia, eugene, random
-DEFAULT_SILERO_VOICE = "baya"
+DEFAULT_SILERO_VOICE = "eugene"
 DEFAULT_SILERO_MODEL = "v4_ru"
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?…])\s+|\n+")
 
