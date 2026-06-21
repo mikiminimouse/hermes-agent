@@ -799,6 +799,10 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
             if meet_lang:
                 context_args["locale"] = meet_lang
             if user_data_dir:
+                # Self-heal: drop a stale lock from a crashed prior bot so we
+                # take the REAL signed-in profile (not a guest fallback that
+                # Meet would bounce as uninvited).
+                _clear_stale_singleton_lock(user_data_dir)
                 # Persistent real-Chrome profile: the signed-in Google session
                 # lives in the profile itself, so no storage_state is needed.
                 # Keep Chrome's *native* user-agent — overriding it to a fake
@@ -1271,6 +1275,39 @@ def _try_guest_name(page, guest_name: str) -> bool:
     except Exception:
         pass
     return False
+
+
+def _clear_stale_singleton_lock(user_data_dir: str) -> None:
+    """Remove a stale Chrome ``SingletonLock`` so a crashed previous bot can't
+    force this launch into a throwaway (not-signed-in) profile.
+
+    Chrome guards a profile dir with ``SingletonLock`` — on Linux a symlink whose
+    target is ``<hostname>-<pid>``. If a prior bot died without tearing Chrome
+    down, the lock lingers; ``launch_persistent_context`` then can't take the
+    real profile and opens a guest one, so Meet sees an *uninvited* participant
+    and hard-bounces it ("You can't join this video call"). We clear the lock
+    ONLY when its PID is dead — never when a live Chrome legitimately holds it.
+    """
+    try:
+        prof = Path(user_data_dir)
+        lock = prof / "SingletonLock"
+        if not lock.is_symlink():
+            return  # Linux Chrome always uses a symlink; leave anything else.
+        alive = False
+        try:
+            pid = int(os.readlink(lock).rsplit("-", 1)[-1])
+            from gateway.status import _pid_exists
+            alive = _pid_exists(pid)
+        except Exception:
+            alive = False  # unparseable / dangling → treat as stale
+        if not alive:
+            for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+                try:
+                    (prof / name).unlink()
+                except (FileNotFoundError, OSError):
+                    pass
+    except Exception:
+        pass
 
 
 def _dump_admission_snapshot(page, out_dir, note: str) -> None:
