@@ -126,11 +126,16 @@ class AudioBridge:
         sink_mod_id = self._parse_module_id(sink_out.stdout)
 
         try:
+            # Use module-remap-source (NOT module-virtual-source): a remap
+            # source actually re-exposes the null-sink's monitor as a normal,
+            # capturable source. module-virtual-source loads but passes NO audio
+            # through to the remapped source (verified: monitor RMS>0 but the
+            # virtual-source RMS=0), so Chrome's fake-mic captured pure silence.
             src_out = subprocess.run(
                 [
                     "pactl",
                     "load-module",
-                    "module-virtual-source",
+                    "module-remap-source",
                     f"source_name={src_name}",
                     f"master={sink_name}.monitor",
                 ],
@@ -148,7 +153,7 @@ class AudioBridge:
                 stdin=subprocess.DEVNULL,
             )
             raise RuntimeError(
-                f"pactl load-module virtual-source failed: {exc.stderr or exc}"
+                f"pactl load-module remap-source failed: {exc.stderr or exc}"
             ) from exc
 
         src_mod_id = self._parse_module_id(src_out.stdout)
