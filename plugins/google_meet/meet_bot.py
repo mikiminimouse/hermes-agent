@@ -537,10 +537,19 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
             # via the process env before launch so the child Chrome inherits it.
             for k, v in chrome_env.items():
                 os.environ[k] = v
-            browser = pw.chromium.launch(
-                headless=not headed,
-                args=chrome_args,
-            )
+            # Browser engine selection (env-gated; default = bundled Chromium,
+            # unchanged behavior). Real Chrome + a persistent profile is the
+            # robust path against Google's "this browser may not be secure"
+            # automation block. executable_path and channel are mutually
+            # exclusive in Playwright, so prefer an explicit path when given.
+            chrome_channel = os.environ.get("HERMES_MEET_CHROME_CHANNEL", "").strip()
+            chrome_path = os.environ.get("HERMES_MEET_CHROME_PATH", "").strip()
+            user_data_dir = os.environ.get("HERMES_MEET_USER_DATA_DIR", "").strip()
+            launch_kwargs = {"headless": not headed, "args": chrome_args}
+            if chrome_path:
+                launch_kwargs["executable_path"] = chrome_path
+            elif chrome_channel:
+                launch_kwargs["channel"] = chrome_channel
             context_args = {
                 "viewport": {"width": 1280, "height": 800},
                 "user_agent": (
@@ -550,10 +559,34 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
             }
             if rt["enabled"]:
                 context_args["permissions"] = ["microphone", "camera"]
-            if auth_state and Path(auth_state).is_file():
-                context_args["storage_state"] = auth_state
-            context = browser.new_context(**context_args)
-            page = context.new_page()
+            if user_data_dir:
+                # Persistent real-Chrome profile: the signed-in Google session
+                # lives in the profile itself, so no storage_state is needed.
+                browser = None
+                context = pw.chromium.launch_persistent_context(
+                    user_data_dir, **launch_kwargs, **context_args
+                )
+                page = context.pages[0] if context.pages else context.new_page()
+            else:
+                if auth_state and Path(auth_state).is_file():
+                    context_args["storage_state"] = auth_state
+                browser = pw.chromium.launch(**launch_kwargs)
+                context = browser.new_context(**context_args)
+                page = context.new_page()
+
+            # Optional auth gate (reference authed flow). Off by default so the
+            # guest / storage_state smoke paths are unaffected. When required,
+            # fail fast with a clear reason instead of silently landing on
+            # Google's "browser may not be secure" page mid-join.
+            if os.environ.get("HERMES_MEET_REQUIRE_AUTH", "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+            ):
+                authed, reason = _auth_gate(page)
+                if not authed:
+                    state.set(error=f"auth gate failed: {reason}", exited=True)
+                    return 4
 
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=30_000)
@@ -714,7 +747,8 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
                 pass
 
             context.close()
-            browser.close()
+            if browser is not None:
+                browser.close()
             # v2: teardown PCM pump, speaker thread, and audio bridge.
             if rt.get("pcm_pump"):
                 try:
@@ -750,13 +784,24 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
         return 1
 
 
-def _try_guest_name(page, guest_name: str) -> None:
-    """If Meet is showing a guest-name field, type *guest_name* into it."""
+def _try_guest_name(page, guest_name: str) -> bool:
+    """If Meet is showing a guest-name field, type *guest_name* into it.
+
+    Returns True if a field was found and filled. Meet renders the name input
+    a beat *after* the "Got it" dialog is dismissed, so when we detect the
+    guest flow we poll for the field (up to ~10s) instead of giving up on the
+    first miss — that first-miss was why "Ask to join" stayed disabled and the
+    join silently failed. After filling we dispatch an ``input`` event so
+    Meet's React listener re-enables the join button. The authed path ("Join
+    now", no name field) skips the poll entirely and pays no latency.
+    """
+    guest_flow = False
     try:
         got_it = page.get_by_role("button", name="Got it", exact=True).first
         if got_it.count() and got_it.is_visible():
             got_it.click(timeout=2_000)
             page.wait_for_timeout(500)
+            guest_flow = True
     except Exception:
         pass
 
@@ -768,20 +813,47 @@ def _try_guest_name(page, guest_name: str) -> None:
         '[role="textbox"][aria-label*="name" i]',
         '[contenteditable="true"][aria-label*="name" i]',
     )
-    for selector in selectors:
-        try:
-            locator = page.locator(selector).first
-            if locator.count() and locator.is_visible():
-                locator.fill(guest_name, timeout=2_000)
-                return
-        except Exception:
-            continue
+
+    def _fill_first() -> bool:
+        for selector in selectors:
+            try:
+                locator = page.locator(selector).first
+                if locator.count() and locator.is_visible():
+                    locator.fill(guest_name, timeout=2_000)
+                    # Nudge Meet's listener so "Ask to join" un-disables.
+                    try:
+                        locator.evaluate(
+                            "(el) => el.dispatchEvent("
+                            "new Event('input', {bubbles: true}))"
+                        )
+                    except Exception:
+                        pass
+                    return True
+            except Exception:
+                continue
+        return False
+
+    if _fill_first():
+        return True
+
+    if guest_flow:
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            try:
+                page.wait_for_timeout(500)
+            except Exception:
+                break
+            if _fill_first():
+                return True
+
     try:
         textbox = page.get_by_role("textbox").first
         if textbox.count() and textbox.is_visible():
             textbox.fill(guest_name, timeout=2_000)
+            return True
     except Exception:
         pass
+    return False
 
 
 def _detect_admission(page) -> bool:
@@ -840,6 +912,47 @@ def _detect_denied(page) -> bool:
         return bool(page.evaluate(probe))
     except Exception:
         return False
+
+
+def _auth_gate(page):
+    """Verify the browser is signed in to Google before joining a meeting.
+
+    Navigates to the account page and decides by the *landing URL* (robust)
+    plus Google's "this browser may not be secure" automation-block text.
+    URL is used instead of body-text scraping because a genuinely signed-in
+    ``myaccount`` page contains settings labels like "Sign-in & security" that
+    would false-positive a naive "sign in" text match. When signed out, Google
+    redirects ``myaccount.google.com`` to an ``accounts.google.com`` sign-in
+    flow. Returns ``(authed: bool, reason: str)``; conservative on any error.
+    """
+    try:
+        page.goto(
+            "https://myaccount.google.com/",
+            wait_until="domcontentloaded",
+            timeout=30_000,
+        )
+    except Exception as e:
+        return (False, f"account page navigation failed: {e}")
+    try:
+        url_now = (page.url or "").lower()
+    except Exception:
+        url_now = ""
+    try:
+        text = (
+            page.evaluate("() => (document.body ? document.body.innerText || '' : '')")
+            or ""
+        ).lower()
+    except Exception:
+        text = ""
+    if "may not be secure" in text:
+        return (False, "google blocked this browser as insecure (automation detected)")
+    if "accounts.google.com" in url_now and (
+        "signin" in url_now or "servicelogin" in url_now
+    ):
+        return (False, f"redirected to sign-in ({url_now})")
+    if "myaccount.google.com" in url_now:
+        return (True, "signed in")
+    return (False, f"could not confirm signed-in state (url={url_now or 'unknown'})")
 
 
 def _looks_like_human_speaker(speaker: str, bot_guest_name: str) -> bool:

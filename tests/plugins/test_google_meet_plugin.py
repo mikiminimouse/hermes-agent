@@ -965,3 +965,105 @@ def test_cmd_install_realtime_skips_when_deps_present(capsys):
     assert sudo_calls == [], f"unexpected sudo invocation: {sudo_calls}"
     out = capsys.readouterr().out
     assert "already installed" in out
+
+
+def test_auth_gate_signed_in():
+    """myaccount stays on myaccount.google.com => authed."""
+    from plugins.google_meet.meet_bot import _auth_gate
+
+    class _Page:
+        url = "https://myaccount.google.com/"
+
+        def goto(self, *a, **k):
+            pass
+
+        def evaluate(self, _js):
+            return "Welcome, Verter — Manage your Google Account"
+
+    authed, _reason = _auth_gate(_Page())
+    assert authed is True
+
+
+def test_auth_gate_signed_out_redirect():
+    """Redirect to accounts.google.com/.../signin => not authed."""
+    from plugins.google_meet.meet_bot import _auth_gate
+
+    class _Page:
+        url = "https://accounts.google.com/v3/signin/identifier?continue=x"
+
+        def goto(self, *a, **k):
+            pass
+
+        def evaluate(self, _js):
+            return "Sign in"
+
+    authed, reason = _auth_gate(_Page())
+    assert authed is False
+    assert "sign-in" in reason
+
+
+def test_auth_gate_insecure_block():
+    """Google's automation block text => not authed, regardless of URL."""
+    from plugins.google_meet.meet_bot import _auth_gate
+
+    class _Page:
+        url = "https://accounts.google.com/signin/v2/challenge"
+
+        def goto(self, *a, **k):
+            pass
+
+        def evaluate(self, _js):
+            return "This browser or app may not be secure."
+
+    authed, reason = _auth_gate(_Page())
+    assert authed is False
+    assert "insecure" in reason
+
+
+def test_try_guest_name_fills_and_dispatches_input():
+    """Selector match => fill, dispatch input event, return True."""
+    from plugins.google_meet.meet_bot import _try_guest_name
+
+    class _Loc:
+        def __init__(self):
+            self.first = self
+            self.filled = None
+            self.dispatched = False
+
+        def count(self):
+            return 1
+
+        def is_visible(self):
+            return True
+
+        def fill(self, value, timeout=None):
+            self.filled = value
+
+        def evaluate(self, _js):
+            self.dispatched = True
+
+    class _NoGotIt:
+        def __init__(self):
+            self.first = self
+
+        def count(self):
+            return 0
+
+        def is_visible(self):
+            return False
+
+    class _Page:
+        def __init__(self):
+            self.loc = _Loc()
+
+        def get_by_role(self, role, **kw):
+            return _NoGotIt()
+
+        def locator(self, _selector):
+            return self.loc
+
+    page = _Page()
+    ok = _try_guest_name(page, "Verter")
+    assert ok is True
+    assert page.loc.filled == "Verter"
+    assert page.loc.dispatched is True

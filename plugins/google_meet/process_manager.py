@@ -154,6 +154,18 @@ def start(
         env["HERMES_MEET_REALTIME_INSTRUCTIONS"] = realtime_instructions
     if realtime_api_key:
         env["HERMES_MEET_REALTIME_KEY"] = realtime_api_key
+    # Real-Chrome / persistent-profile passthrough. These are inherited via
+    # os.environ.copy() above, but we forward them explicitly so the bot's
+    # browser-engine contract is visible at the spawn site and survives any
+    # future change to how `env` is built. Unset => bot uses bundled Chromium.
+    for _k in (
+        "HERMES_MEET_CHROME_CHANNEL",
+        "HERMES_MEET_CHROME_PATH",
+        "HERMES_MEET_USER_DATA_DIR",
+    ):
+        _v = os.environ.get(_k)
+        if _v:
+            env[_k] = _v
 
     log_path = out / "bot.log"
     # Detach: stdin=devnull, stdout/stderr → log file, new session so parent

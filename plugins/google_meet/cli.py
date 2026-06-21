@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -192,12 +193,37 @@ def _cmd_setup() -> int:
             chromium_msg = f"probe failed: {e}"
     print(f"  chromium       : {chromium_msg}")
 
-    auth_path = _auth_state_path()
-    auth_ok = auth_path.is_file()
-    print(
-        "  google auth    : "
-        + (f"ok ({auth_path})" if auth_ok else "not saved — run: hermes meet auth")
-    )
+    # Browser engine (env-gated). Default = bundled Chromium; a real-Chrome
+    # persistent profile is the robust path against Google's automation block.
+    chrome_channel = os.environ.get("HERMES_MEET_CHROME_CHANNEL", "").strip()
+    chrome_path = os.environ.get("HERMES_MEET_CHROME_PATH", "").strip()
+    user_data_dir = os.environ.get("HERMES_MEET_USER_DATA_DIR", "").strip()
+    if chrome_path or chrome_channel or user_data_dir:
+        engine = chrome_path or (f"channel={chrome_channel}" if chrome_channel else "chromium")
+        print(f"  browser engine : real-Chrome ({engine})")
+    else:
+        print("  browser engine : bundled chromium (default)")
+
+    if user_data_dir:
+        # Persistent profile: the signed-in session lives in the profile, not
+        # in an auth.json. We treat a populated profile dir as authed.
+        prof = Path(user_data_dir)
+        prof_ok = prof.is_dir() and any(prof.iterdir())
+        print(
+            "  google auth    : "
+            + (
+                f"ok (persistent profile {prof})"
+                if prof_ok
+                else f"empty profile {prof} — run: hermes meet auth"
+            )
+        )
+    else:
+        auth_path = _auth_state_path()
+        prof_ok = auth_path.is_file()
+        print(
+            "  google auth    : "
+            + (f"ok ({auth_path})" if prof_ok else "not saved — run: hermes meet auth")
+        )
 
     print()
     all_ok = system_ok and pw_ok and chromium_ok
@@ -334,7 +360,16 @@ def _cmd_install(*, realtime: bool, assume_yes: bool) -> int:
 
 
 def _cmd_auth() -> int:
-    """Open a headed Chromium, let the user sign in, save storage_state."""
+    """Open a headed browser, let the user sign in, persist the session.
+
+    Default: bundled Chromium → ``storage_state`` JSON (unchanged behavior).
+    With ``HERMES_MEET_USER_DATA_DIR`` set, use a real-Chrome persistent
+    profile (channel/executable_path from ``HERMES_MEET_CHROME_*``) — the
+    robust path against Google's "this browser may not be secure" automation
+    block. There the signed-in session lives inside the profile directory, so
+    no storage_state file is written and ``meet join`` must use the same
+    profile env.
+    """
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -344,27 +379,55 @@ def _cmd_auth() -> int:
         )
         return 1
 
-    path = _auth_state_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
+    chrome_channel = os.environ.get("HERMES_MEET_CHROME_CHANNEL", "").strip()
+    chrome_path = os.environ.get("HERMES_MEET_CHROME_PATH", "").strip()
+    user_data_dir = os.environ.get("HERMES_MEET_USER_DATA_DIR", "").strip()
+    launch_kwargs = {"headless": False}
+    if chrome_path:
+        launch_kwargs["executable_path"] = chrome_path
+    elif chrome_channel:
+        launch_kwargs["channel"] = chrome_channel
 
-    print(f"opening Chromium — sign in to Google, then return here and press Enter.")
-    print(f"saving storage state to: {path}")
+    print("opening browser — sign in to Google, then return here and press Enter.")
     try:
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=False)
-            context = browser.new_context()
-            page = context.new_page()
-            page.goto("https://accounts.google.com/", wait_until="domcontentloaded")
-            try:
-                input("press Enter after you've signed in ... ")
-            except EOFError:
-                pass
-            context.storage_state(path=str(path))
-            browser.close()
+            if user_data_dir:
+                Path(user_data_dir).mkdir(parents=True, exist_ok=True)
+                print(f"using persistent profile: {user_data_dir}")
+                context = pw.chromium.launch_persistent_context(
+                    user_data_dir, **launch_kwargs
+                )
+                page = context.pages[0] if context.pages else context.new_page()
+                page.goto(
+                    "https://accounts.google.com/", wait_until="domcontentloaded"
+                )
+                try:
+                    input("press Enter after you've signed in ... ")
+                except EOFError:
+                    pass
+                context.close()
+                print("signed-in session saved inside the persistent profile.")
+            else:
+                path = _auth_state_path()
+                path.parent.mkdir(parents=True, exist_ok=True)
+                print(f"saving storage state to: {path}")
+                browser = pw.chromium.launch(**launch_kwargs)
+                context = browser.new_context()
+                page = context.new_page()
+                page.goto(
+                    "https://accounts.google.com/", wait_until="domcontentloaded"
+                )
+                try:
+                    input("press Enter after you've signed in ... ")
+                except EOFError:
+                    pass
+                context.storage_state(path=str(path))
+                browser.close()
+                print(f"saved storage state to {path}.")
     except Exception as e:
         print(f"auth failed: {e}")
         return 1
-    print("saved. you can now run: hermes meet join <url>")
+    print("done. you can now run: hermes meet join <url>")
     return 0
 
 
