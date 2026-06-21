@@ -206,13 +206,17 @@ def _cmd_setup() -> int:
 
     if user_data_dir:
         # Persistent profile: the signed-in session lives in the profile, not
-        # in an auth.json. We treat a populated profile dir as authed.
+        # in an auth.json. A populated dir only proves the profile EXISTS — not
+        # that the Google session is still valid (Chrome writes files whether
+        # signed in or not). Report honestly; the real check is the join-time
+        # auth gate (HERMES_MEET_REQUIRE_AUTH) / `hermes meet auth`.
         prof = Path(user_data_dir)
         prof_ok = prof.is_dir() and any(prof.iterdir())
         print(
             "  google auth    : "
             + (
-                f"ok (persistent profile {prof})"
+                f"profile present, sign-in NOT verified ({prof}) — "
+                "verified at join via auth gate"
                 if prof_ok
                 else f"empty profile {prof} — run: hermes meet auth"
             )

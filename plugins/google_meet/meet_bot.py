@@ -239,21 +239,33 @@ _CAPTION_OBSERVER_JS = r"""
 def _enable_captions_js() -> str:
     """Return JS that turns on Meet's live captions.
 
-    Clicks the real toolbar button (``aria-label`` "Turn on captions" + RU
-    "Включить субтитры"), falling back to the ``c`` keyboard shortcut. The
-    button only exists *in-call*, so this must run after admission — in the
-    lobby it is a no-op. Idempotent: once captions are on the button reads
-    "Turn off captions" and no longer matches, so re-running won't toggle them
-    back off. Returns true if the button was found and clicked. The synthetic
-    ``c`` keystroke alone does not work in headless Chrome — hence the click.
+    Locale-independent + state-aware. Primary anchor is the material-icon
+    ligature ``closed_caption_off`` (captions currently OFF) which is identical
+    in every UI language; falls back to text ("Turn on captions" / RU "Включить
+    субтитры") then the ``c`` keystroke. Idempotent: only clicks when captions
+    are OFF — once ON the button shows ``closed_caption`` / "Turn off", which is
+    left alone, so re-running never toggles captions back off. The button only
+    exists *in-call*, so this is a no-op in the lobby. Returns true if it
+    clicked. The synthetic ``c`` keystroke alone does not work headless.
     """
     return r"""
     (() => {
-      const btn = Array.from(document.querySelectorAll('button')).find((b) => {
-        const s = `${b.innerText || ''} ${b.getAttribute('aria-label') || ''}`;
-        return /turn on captions|включить субтитры/i.test(s);
+      const buttons = Array.from(document.querySelectorAll('button'));
+      const off = buttons.find((b) => {
+        const inner = b.innerText || '';
+        const s = inner + ' ' + (b.getAttribute('aria-label') || '');
+        return /closed_caption_off/i.test(inner)
+          || /turn on captions|включить субтитры/i.test(s);
       });
-      if (btn) { btn.click(); return true; }
+      if (off) { off.click(); return true; }
+      // Already on? (ligature 'closed_caption' without _off, or "turn off")
+      const on = buttons.some((b) => {
+        const inner = b.innerText || '';
+        const s = inner + ' ' + (b.getAttribute('aria-label') || '');
+        return /closed_caption(?!_off)/i.test(inner)
+          || /turn off captions|выключить субтитры|отключить субтитры/i.test(s);
+      });
+      if (on) return false;
       const ev = new KeyboardEvent('keydown', {
         key: 'c', code: 'KeyC', keyCode: 67, which: 67, bubbles: true,
       });
@@ -266,58 +278,100 @@ def _enable_captions_js() -> str:
 def _set_caption_language(page, lang: str) -> bool:
     """Open caption settings and set the meeting/caption language.
 
-    Meet's live captions transcribe ONLY the configured language — there is no
-    auto-detect — so in transcribe mode the language must match the speakers or
-    the caption region stays empty. Opens Settings → Captions → "Language of
-    the meeting" and picks the first option whose label matches *lang*
-    (case-insensitive, e.g. "Russian" / "Русский"). Best-effort; returns True
-    only when an option was actually selected. Uses Playwright role locators
-    (combobox/option) rather than raw DOM clicks because the dropdown is a
-    custom listbox that renders options lazily.
+    Robust to the settings UI being in RU or EN. Meet transcribes ONLY the
+    configured language (no auto-detect), so transcribe mode must set it or the
+    caption region stays empty. Opens Settings → Captions (caption-settings text
+    in RU/EN, else the ``settings`` gear ligature), opens the "Language of the
+    meeting" combobox (ARIA role, preferring one whose name mentions
+    language/язык when several exist), and selects the Russian option by its
+    localized label — "Russian" in EN UI, "Русский" in RU UI — matched
+    independently of the configured value so captions always end up Russian. The
+    configured *lang* is re.escaped and added as an extra alias. Best-effort;
+    returns True only when an option was selected. Closes via the dialog's close
+    control (Escape fallback) so it doesn't cover the caption region.
     """
+    def _log(msg: str) -> None:
+        try:
+            print(f"[meet_bot] caption-language: {msg}", flush=True)
+        except Exception:
+            pass
+
+    # Open caption settings: localized text first, then the gear ligature.
     try:
         page.evaluate(
-            "()=>{const b=[...document.querySelectorAll('button')].find("
-            "x=>/open caption settings|caption settings|настройки субтитров/i"
-            ".test((x.innerText||'')+' '+(x.getAttribute('aria-label')||'')));"
-            "if(b)b.click()}"
+            r"""()=>{
+              const bs=[...document.querySelectorAll('button,[role="button"]')];
+              const t=bs.find(x=>/open caption settings|caption settings|(настройки|параметры) субтитров/i
+                .test((x.innerText||'')+' '+(x.getAttribute('aria-label')||'')));
+              if(t){t.click();return;}
+              const g=bs.find(x=>(x.innerText||'').trim()==='settings'
+                || /^(settings|настройки)$/i.test(x.getAttribute('aria-label')||''));
+              if(g)g.click();
+            }"""
         )
-    except Exception:
+    except Exception as e:
+        _log(f"settings button failed: {e}")
         return False
     try:
         page.wait_for_timeout(1500)
     except Exception:
         pass
-    rx = re.compile(lang, re.I)
+
+    # Always select Russian; also accept the configured label (escaped) as alias.
+    safe = re.escape((lang or "").strip())
+    ru_pat = r"^\s*(russian|русск" + (("|" + safe) if safe else "") + r")"
+    rx_ru = re.compile(ru_pat, re.I)
+
+    # Open the language combobox (role anchor; prefer language/язык-named one).
     opened = False
     try:
-        page.get_by_role("combobox").first.click(timeout=3_000)
-        opened = True
-    except Exception:
-        try:
-            page.get_by_label(re.compile("language", re.I)).first.click(timeout=3_000)
+        named = page.get_by_role("combobox", name=re.compile(r"language|язык", re.I))
+        if named.count():
+            named.first.click(timeout=3_000)
             opened = True
-        except Exception:
-            opened = False
+    except Exception:
+        opened = False
     if not opened:
-        return False
+        try:
+            page.get_by_role("combobox").first.click(timeout=3_000)
+            opened = True
+        except Exception as e:
+            _log(f"combobox open failed: {e}")
+            return False
     try:
         page.wait_for_timeout(800)
     except Exception:
         pass
+
     selected = False
     try:
-        opt = page.get_by_role("option", name=rx).first
+        opt = page.get_by_role("option", name=rx_ru).first
         if opt.count():
             opt.click(timeout=3_000)
             selected = True
-    except Exception:
+    except Exception as e:
+        _log(f"option select failed: {e}")
         selected = False
-    # Close the settings dialog so it doesn't cover the caption region.
+    if not selected:
+        _log("russian option not found")
+
+    # Close settings via its close control; Escape only as a fallback.
     try:
-        page.keyboard.press("Escape")
+        closed = page.evaluate(
+            r"""()=>{
+              const b=[...document.querySelectorAll('button,[role="button"]')].find(x=>
+                (x.innerText||'').trim()==='close'
+                || /^(close|закрыть)$/i.test(x.getAttribute('aria-label')||''));
+              if(b){b.click();return true;} return false;
+            }"""
+        )
     except Exception:
-        pass
+        closed = False
+    if not closed:
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
     return selected
 
 
@@ -766,6 +820,15 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
                             lobby_waiting=False,
                             joined_at=now,
                         )
+                    # Check denial BEFORE the timeout so a real host-denial isn't
+                    # misattributed as a lobby timeout (it would otherwise wait
+                    # the full window and report the wrong leave_reason).
+                    elif _detect_denied(page):
+                        state.set(
+                            error="host denied admission",
+                            leave_reason="denied",
+                        )
+                        break
                     elif now > lobby_deadline:
                         state.set(
                             error=(
@@ -773,12 +836,6 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
                                 f"within {int(lobby_deadline - state.join_attempted_at) if state.join_attempted_at else 0}s"
                             ),
                             leave_reason="lobby_timeout",
-                        )
-                        break
-                    elif _detect_denied(page):
-                        state.set(
-                            error="host denied admission",
-                            leave_reason="denied",
                         )
                         break
 
@@ -847,11 +904,20 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
 
                 time.sleep(1.0)
 
-            # Try to leave cleanly — click "Leave call" button if present.
+            # Try to leave cleanly — click the hangup button if present. Anchor
+            # on the locale-independent 'call_end' icon ligature first, then
+            # RU/EN aria text, so this works whether the UI is English or
+            # Russian (the old aria*="eave call" was English-only).
             try:
                 page.evaluate(
-                    "() => { const b = document.querySelector('button[aria-label*=\"eave call\"]');"
-                    " if (b) b.click(); }"
+                    r"""() => {
+                      const b = [...document.querySelectorAll('button')].find((x) => {
+                        const t = (x.innerText || '') + ' ' + (x.getAttribute('aria-label') || '');
+                        return /call_end/i.test(x.innerText || '')
+                          || /leave call|leave meeting|покинуть видеовстреч|покинуть вызов|покинуть звон|выйти из вызова|выйти из звон/i.test(t);
+                      });
+                      if (b) b.click();
+                    }"""
                 )
             except Exception:
                 pass
@@ -907,7 +973,11 @@ def _try_guest_name(page, guest_name: str) -> bool:
     """
     guest_flow = False
     try:
-        got_it = page.get_by_role("button", name="Got it", exact=True).first
+        # Bilingual: EN "Got it" / RU "Понятно". The old EN-only exact match
+        # meant a RU dialog never set guest_flow, skipping the name-field poll.
+        got_it = page.get_by_role(
+            "button", name=re.compile(r"^(got it|понятно)$", re.I)
+        ).first
         if got_it.count() and got_it.is_visible():
             got_it.click(timeout=2_000)
             page.wait_for_timeout(500)
@@ -982,20 +1052,29 @@ def _detect_admission(page) -> bool:
     probe = r"""
     (() => {
       const buttons = Array.from(document.querySelectorAll('button'));
+      // 1) Hangup button — 'call_end' ligature (locale-independent) or RU/EN aria.
       const leave = buttons.find((b) => {
         const text = `${b.innerText || ''} ${b.getAttribute('aria-label') || ''}`;
-        return /leave call|leave meeting|покинуть видеовстречу|покинуть вызов|покинуть звонок|выйти из вызова|выйти из звонка/i.test(text);
+        return /call_end/i.test(b.innerText || '')
+          || /leave call|leave meeting|покинуть видеовстреч|покинуть вызов|покинуть звон|выйти из вызова|выйти из звон/i.test(text);
       });
       if (leave) return true;
+      // 2) Caption region appeared — RU/EN aria (Captions/Субтитры) + current jsname.
       if (window.__hermesMeetInstalled) {
         const caps = document.querySelector(
           '[role="region"][aria-label*="aption" i], ' +
-          'div[jsname="YSxPC"], div[jsname="tgaKEf"]'
+          '[role="region"][aria-label*="убтитр" i], ' +
+          'div[jsname="dsyhDe"]'
         );
         if (caps) return true;
       }
-      const parts = document.querySelector('[aria-label*="articipants" i]');
+      // 3) Participants container — RU/EN aria or people/group ligature button.
+      const parts = document.querySelector(
+        '[aria-label*="articipants" i], [aria-label*="участник" i]'
+      );
       if (parts) return true;
+      const partBtn = buttons.some((b) => /^(people|group)$/i.test((b.innerText || '').trim()));
+      if (partBtn) return true;
       return false;
     })();
     """
@@ -1006,15 +1085,25 @@ def _detect_admission(page) -> bool:
 
 
 def _detect_denied(page) -> bool:
-    """True when Meet is showing a 'you were denied' / 'no one admitted' page."""
+    """True when Meet is showing a 'you were denied' / 'no one admitted' page.
+
+    Matches both EN and RU wordings (loose stems to survive declension). Without
+    the RU variants a denied/removed RU-locale bot was misclassified as a lobby
+    timeout — wrong leave_reason and a full HERMES_MEET_LOBBY_TIMEOUT wait.
+    """
     probe = r"""
     (() => {
       const text = document.body ? document.body.innerText || '' : '';
-      // English only — matches what shows up when the host denies or
-      // removes a guest.
+      // Denied / can't join.
       if (/You can't join this video call/i.test(text)) return true;
+      if (/не можете присоединиться к (этой |этому )?(видео)?(встрече|звонку|конференции)/i.test(text)) return true;
+      if (/вам отказано в доступе|в доступе отказано/i.test(text)) return true;
+      // Removed from the meeting.
       if (/You were removed from the meeting/i.test(text)) return true;
+      if (/вас удалил[аи]? (из|со) (встречи|видеовстречи|звонка|конференции)/i.test(text)) return true;
+      // No one responded to the join request.
       if (/No one responded to your request to join/i.test(text)) return true;
+      if (/никто не ответил на ваш запрос/i.test(text)) return true;
       return false;
     })();
     """
@@ -1103,15 +1192,14 @@ def _click_join(page, state: _BotState) -> bool:
     Flags ``lobby_waiting`` when we hit the "waiting for host to admit you"
     state so the agent can surface that in status.
     """
+    # Pre-join buttons, bilingual (RU+EN). Order matters: match the
+    # ask-to-join (host-admission) variant BEFORE the plain join, because in RU
+    # the affirmative button's visible text is also "Присоединиться" and only
+    # its aria-label ("Отправить запрос…") marks the lobby flow.
     candidates = (
-        ("Join now", False),
-        ("Ask to join", True),
-        ("Присоединиться", False),
-        # "Join here" appears when this Google account is already in the call
-        # on another device (e.g. a crashed/ghosted prior bot session). It
-        # joins immediately as a second instance — useful for recovery. We do
-        # NOT click "Switch here": that would move someone else's call.
-        ("Join here", False),
+        (re.compile(r"ask to join|отправить запрос|запросить подключение", re.I), True),
+        (re.compile(r"\bjoin now\b|^\s*присоединиться\s*$", re.I), False),
+        (re.compile(r"join here|присоединиться здесь", re.I), False),
     )
     deadline = time.time() + 20.0
     while time.time() < deadline:
@@ -1119,22 +1207,21 @@ def _click_join(page, state: _BotState) -> bool:
             page.evaluate(
                 r"""
                 () => {
-                  const click = (rx) => {
+                  const click = (rx, avoid) => {
                     const b = Array.from(document.querySelectorAll('button')).find((btn) => {
                       const text = `${btn.innerText || ''} ${btn.getAttribute('aria-label') || ''}`;
-                      return rx.test(text);
+                      return rx.test(text) && !(avoid && avoid.test(text));
                     });
                     if (b) { b.click(); return true; }
                     return false;
                   };
                   // Receive-only (transcribe) mode has no microphone, so Meet
-                  // shows a "Do you want people to hear you?" modal that OVERLAYS
-                  // the join button. Dismiss it via "Continue without microphone"
-                  // (and the older "don't use microphone" wording + RU variants),
-                  // but never match the affirmative "Use microphone" button.
-                  click(/don't use microphone|do not use microphone|continue without microphone|не включать микрофон|продолжить без микрофона|без микрофона/i);
-                  // Dismiss onboarding tooltips ("Got it" / "Понятно") that can
-                  // cover the join controls (e.g. the "Switch here" coachmark).
+                  // shows a "Do you want people to hear you?" modal overlaying the
+                  // join button. Dismiss it (RU+EN) but NEVER the affirmative
+                  // "Use microphone" / "Использовать микрофон" (explicit guard).
+                  click(/don't use microphone|do not use microphone|continue without microphone|продолжить без микрофона|не включать микрофон|без микрофона/i,
+                        /use microphone|использовать микрофон/i);
+                  // Dismiss onboarding tooltips ("Got it" / "Понятно").
                   click(/^\s*got it\s*$|^\s*понятно\s*$/i);
                   return true;
                 }
@@ -1143,9 +1230,9 @@ def _click_join(page, state: _BotState) -> bool:
         except Exception:
             pass
 
-        for label, waits_for_lobby in candidates:
+        for name_rx, waits_for_lobby in candidates:
             try:
-                btn = page.get_by_role("button", name=label, exact=False).first
+                btn = page.get_by_role("button", name=name_rx).first
                 if btn.count() and btn.is_visible():
                     btn.click(timeout=3_000)
                     if waits_for_lobby:
@@ -1159,20 +1246,24 @@ def _click_join(page, state: _BotState) -> bool:
                 r"""
                 () => {
                   const labels = [
-                    { rx: /^Join now$/i, waitsForLobby: false },
-                    { rx: /^Ask to join$/i, waitsForLobby: true },
-                    { rx: /^Присоединиться$/i, waitsForLobby: false },
-                    // Not anchored: the button's innerText is prefixed with the
-                    // material-icon ligature, e.g. "add_to_queueJoin here".
-                    { rx: /join here/i, waitsForLobby: false },
+                    { rx: /ask to join|отправить запрос|запросить подключение/i, avoid: /companion|режиме companion/i, waitsForLobby: true },
+                    { rx: /\bjoin now\b|^присоединиться$/i, avoid: null, waitsForLobby: false },
                   ];
                   for (const b of Array.from(document.querySelectorAll('button'))) {
                     const inner = (b.innerText || '').trim();
                     const aria = (b.getAttribute('aria-label') || '').trim();
+                    const text = inner + ' ' + aria;
                     const visible = !!(b.offsetWidth || b.offsetHeight || b.getClientRects().length);
                     const disabled = b.disabled || b.getAttribute('aria-disabled') === 'true';
                     if (!visible || disabled) continue;
-                    const match = labels.find((label) => label.rx.test(inner) || label.rx.test(aria));
+                    // "Join here" recovery (account already in call elsewhere):
+                    // anchor on the locale-independent 'add_to_queue' icon
+                    // ligature, and NEVER click "Switch here" (moves someone's call).
+                    if (/(^|[^a-z])add_to_queue/i.test(inner) && !/switch here|переключиться|сменить устройство/i.test(text)) {
+                      b.click();
+                      return { clicked: true, inner, aria, waitsForLobby: false };
+                    }
+                    const match = labels.find((l) => (l.rx.test(inner) || l.rx.test(aria)) && !(l.avoid && l.avoid.test(text)));
                     if (match) {
                       b.click();
                       return { clicked: true, inner, aria, waitsForLobby: match.waitsForLobby };

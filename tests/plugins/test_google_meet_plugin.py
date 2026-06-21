@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 from pathlib import Path
 from unittest.mock import patch
@@ -751,8 +752,11 @@ def test_click_join_supports_russian_role_label(tmp_path):
         def __init__(self):
             self.ru_button = _FakeButton(True)
 
-        def get_by_role(self, role, name, exact=False):
-            if name == "Присоединиться":
+        def get_by_role(self, role, name=None, exact=False):
+            # name is now a compiled regex (bilingual matcher). Return the RU
+            # button when the pattern matches the Russian join label.
+            pat = name if hasattr(name, "search") else re.compile(re.escape(str(name)), re.I)
+            if pat.search("Присоединиться"):
                 return _FakeLocator(self.ru_button)
             return _FakeLocator(_FakeButton(False))
 
@@ -780,11 +784,12 @@ def test_click_join_uses_dom_fallback_when_role_locator_misses(tmp_path):
         def __init__(self):
             self.dom_clicked = False
 
-        def get_by_role(self, role, name, exact=False):
+        def get_by_role(self, role, name=None, exact=False):
             return _FakeLocator()
 
         def evaluate(self, js):
-            assert "Присоединиться" in js
+            # The DOM fallback scan is bilingual (case-insensitive regexes).
+            assert "присоединиться" in js.lower()
             self.dom_clicked = True
             return {
                 "clicked": True,
@@ -806,15 +811,17 @@ def test_click_join_does_not_include_speculative_labels():
     from plugins.google_meet.meet_bot import _click_join
 
     source = inspect.getsource(_click_join)
-    assert "/^Join now$/i" in source
-    assert "/^Ask to join$/i" in source
-    assert "/^Присоединиться$/i" in source
+    # Real, confirmed RU+EN labels (case-insensitive matchers) + the
+    # locale-independent 'add_to_queue' ligature anchor for "Join here".
+    assert "join now" in source.lower()
+    assert "ask to join" in source
+    assert "присоединиться" in source.lower()
+    assert "отправить запрос" in source.lower()
+    assert "add_to_queue" in source
+    # No speculative/unverified labels.
     for label in (
-        "Подключиться",
         "Tham gia ngay",
         "Yêu cầu tham gia",
-        "Попросить присоединиться",
-        "Запросить присоединение",
         "Запросить доступ",
     ):
         assert label not in source
@@ -1085,3 +1092,46 @@ def test_auth_gate_signed_out_about_page():
     authed, reason = _auth_gate(_Page())
     assert authed is False
     assert "about" in reason
+
+
+def test_enable_captions_uses_locale_independent_ligature():
+    import inspect
+    from plugins.google_meet.meet_bot import _enable_captions_js
+
+    src = _enable_captions_js()
+    # Locale-independent material-icon ligature is the primary anchor.
+    assert "closed_caption_off" in src
+    # Plus bilingual text fallbacks.
+    assert "turn on captions" in src.lower()
+    assert "включить субтитры" in src.lower()
+
+
+def test_detect_denied_is_bilingual():
+    import inspect
+    from plugins.google_meet.meet_bot import _detect_denied
+
+    src = inspect.getsource(_detect_denied)
+    assert "You can't join this video call" in src
+    # Russian denial/removal wordings so RU denials aren't misread as timeouts.
+    assert "не можете присоединиться" in src.lower()
+    assert "удалил" in src.lower()
+
+
+def test_set_caption_language_escapes_and_forces_russian():
+    import inspect
+    from plugins.google_meet.meet_bot import _set_caption_language
+
+    src = inspect.getsource(_set_caption_language)
+    assert "re.escape" in src           # operator value not compiled raw
+    assert "russian" in src.lower()
+    assert "русск" in src.lower()        # matches RU-UI option label too
+
+
+def test_detect_admission_drops_dead_jsname_and_adds_ru():
+    import inspect
+    from plugins.google_meet.meet_bot import _detect_admission
+
+    src = inspect.getsource(_detect_admission)
+    assert "call_end" in src             # locale-independent hangup ligature
+    assert "убтитр" in src               # RU caption region aria stem
+    assert 'jsname="YSxPC"' not in src   # dead legacy selector removed
