@@ -151,6 +151,39 @@ def test_request_summary_skips_when_never_joined_or_empty(tmp_path):
     assert s2.request_summary() is None
 
 
+def test_collapse_transcript_reconstructs_dialogue_from_rolling_captions():
+    from plugins.google_meet.meet_summarize import collapse_transcript
+
+    # Meet captions: each line is a growing snapshot of the caption region with
+    # speaker names embedded INLINE, re-scraped per mutation (prefix growth +
+    # ASR punctuation revision), then the window scrolls.
+    raw = "\n".join([
+        "[10:00:01] Виталий Бычков: Привет",
+        "[10:00:02] Виталий Бычков: Привет давай",
+        "[10:00:02] Виталий Бычков: Привет давай начнём.",
+        "[10:00:05] Виталий Бычков: Привет давай начнём. You Привет",
+        "[10:00:06] Виталий Бычков: Привет давай начнём. You Привет готов",
+        "[10:00:07] Виталий Бычков: Привет давай начнём. You Привет, готов работать.",
+    ])
+    out = collapse_transcript(raw)
+    lines = out.splitlines()
+    # Two final utterances, one per speaker turn, bot relabeled, prefixes gone.
+    assert len(lines) == 2
+    assert "Виталий Бычков:" in lines[0]
+    assert "Привет давай начнём." in lines[0]
+    assert "Verter (бот):" in lines[1]
+    assert "готов работать" in lines[1]
+    # No surviving partial-prefix rows.
+    assert "Привет давай\n" not in out
+
+
+def test_collapse_transcript_empty_and_noise():
+    from plugins.google_meet.meet_summarize import collapse_transcript
+
+    assert collapse_transcript("") == ""
+    assert collapse_transcript("garbage line with no timestamp") == ""
+
+
 def test_parse_duration():
     from plugins.google_meet.meet_bot import _parse_duration
 
