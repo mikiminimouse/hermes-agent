@@ -871,6 +871,8 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
             _try_guest_name(page, guest_name)
             join_clicked = _click_join(page, state)
             if not join_clicked:
+                # Always-on, file-based diagnostics (safe in a detached bot).
+                _dump_admission_snapshot(page, out_dir, "join button not clicked")
                 if os.environ.get('HERMES_MEET_DEBUG_MODE', '').lower() in ('1', 'true', 'yes'):
                     try:
                         debug = page.evaluate(
@@ -994,12 +996,14 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
                     # misattributed as a lobby timeout (it would otherwise wait
                     # the full window and report the wrong leave_reason).
                     elif _detect_denied(page):
+                        _dump_admission_snapshot(page, out_dir, "host denied admission")
                         state.set(
                             error="host denied admission",
                             leave_reason="denied",
                         )
                         break
                     elif now > lobby_deadline:
+                        _dump_admission_snapshot(page, out_dir, "lobby timeout")
                         state.set(
                             error=(
                                 "lobby timeout — host never admitted the bot "
@@ -1008,6 +1012,12 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
                             leave_reason="lobby_timeout",
                         )
                         break
+                    else:
+                        # Still waiting — refresh the lobby snapshot so an
+                        # operator polling mid-wait can see the live page state
+                        # (lobby copy, disabled "Ask to join", name field, etc.)
+                        # without enabling HERMES_MEET_DEBUG_MODE.
+                        _dump_admission_snapshot(page, out_dir, "waiting for admission")
 
                 # Empty-meeting auto-end (throttled ~5s). _detect_alone is
                 # conservative (False on any ambiguity), so we additionally
@@ -1261,6 +1271,46 @@ def _try_guest_name(page, guest_name: str) -> bool:
     except Exception:
         pass
     return False
+
+
+def _dump_admission_snapshot(page, out_dir, note: str) -> None:
+    """Always-on, file-based admission diagnostics (no stdout pollution).
+
+    When the bot can't get past the lobby, the single most useful artifact is
+    what Meet was actually showing — lobby copy, disabled "Ask to join", a
+    host-denial screen, an unfilled name field, etc. We capture a compact
+    snapshot to ``<out_dir>/admission_debug.json`` (overwritten each call, so
+    the file always reflects the latest state). This is separate from the
+    verbose, opt-in ``HERMES_MEET_DEBUG_MODE`` stdout dump: a file write in a
+    detached bot pollutes nothing, so it runs unconditionally and gives the
+    operator (or the agent) something concrete to read after a failed join.
+    """
+    try:
+        import json as _json
+        import time as _time
+        snap = page.evaluate(
+            r"""
+            () => ({
+              url: location.href,
+              text: (document.body && document.body.innerText || '').slice(0, 2000),
+              buttons: Array.from(document.querySelectorAll('button')).map((b, i) => ({
+                i,
+                inner: (b.innerText || '').trim(),
+                aria: (b.getAttribute('aria-label') || '').trim(),
+                visible: !!(b.offsetWidth || b.offsetHeight || b.getClientRects().length),
+                disabled: b.disabled || b.getAttribute('aria-disabled') === 'true',
+              })).filter((x) => x.visible),
+            })
+            """
+        )
+        snap["note"] = note
+        snap["at"] = _time.time()
+        (out_dir / "admission_debug.json").write_text(
+            _json.dumps(snap, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception:
+        # Diagnostics must never break the join flow.
+        pass
 
 
 def _detect_admission(page) -> bool:
