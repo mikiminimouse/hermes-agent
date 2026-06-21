@@ -1067,3 +1067,21 @@ def test_try_guest_name_fills_and_dispatches_input():
     assert ok is True
     assert page.loc.filled == "Verter"
     assert page.loc.dispatched is True
+
+
+def test_auth_gate_signed_out_about_page():
+    """Signed-out users get bounced to google.com/account/about => not authed."""
+    from plugins.google_meet.meet_bot import _auth_gate
+
+    class _Page:
+        url = "https://www.google.com/account/about/?hl=en-US"
+
+        def goto(self, *a, **k):
+            pass
+
+        def evaluate(self, _js):
+            return "Sign in to your Google Account"
+
+    authed, reason = _auth_gate(_Page())
+    assert authed is False
+    assert "about" in reason

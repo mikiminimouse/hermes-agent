@@ -950,6 +950,11 @@ def _auth_gate(page):
         "signin" in url_now or "servicelogin" in url_now
     ):
         return (False, f"redirected to sign-in ({url_now})")
+    # Signed-out users hitting myaccount are bounced to the public marketing
+    # page google.com/account/about — a reliable "not signed in" signal even
+    # when stale cookies remain in the jar (Google invalidates server-side).
+    if "/account/about" in url_now:
+        return (False, "not signed in (bounced to account/about page)")
     if "myaccount.google.com" in url_now:
         return (True, "signed in")
     return (False, f"could not confirm signed-in state (url={url_now or 'unknown'})")
