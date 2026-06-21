@@ -698,7 +698,7 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
                 os.environ.get("HERMES_MEET_LOBBY_TIMEOUT", "300")
             )
             last_admission_check = 0.0
-            captions_enable_attempts = 0
+            last_caption_enable = 0.0
             while not stop_flag["stop"]:
                 now = time.time()
                 if deadline and now > deadline:
@@ -732,11 +732,17 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
                         break
 
                 # Captions can only be turned on in-call, so enable them after
-                # admission. Retry a handful of times (~1s apart) because the
-                # toolbar settles a beat after the lobby clears; the call is
-                # idempotent once captions are on.
-                if state.in_call and captions_enable_attempts < 8:
-                    captions_enable_attempts += 1
+                # admission. Keep retrying (throttled ~3s) until captions
+                # actually produce lines — the caption button can settle several
+                # seconds after admission, and re-clicking is idempotent (once
+                # on, the button reads "Turn off captions" and no longer
+                # matches the "Turn on" regex).
+                if (
+                    state.in_call
+                    and state.transcript_lines == 0
+                    and (now - last_caption_enable) > 3.0
+                ):
+                    last_caption_enable = now
                     try:
                         page.evaluate(_enable_captions_js())
                         state.set(captions_enabled_attempted=True)
@@ -1040,6 +1046,11 @@ def _click_join(page, state: _BotState) -> bool:
         ("Join now", False),
         ("Ask to join", True),
         ("Присоединиться", False),
+        # "Join here" appears when this Google account is already in the call
+        # on another device (e.g. a crashed/ghosted prior bot session). It
+        # joins immediately as a second instance — useful for recovery. We do
+        # NOT click "Switch here": that would move someone else's call.
+        ("Join here", False),
     )
     deadline = time.time() + 20.0
     while time.time() < deadline:
@@ -1047,17 +1058,24 @@ def _click_join(page, state: _BotState) -> bool:
             page.evaluate(
                 r"""
                 () => {
-                  const b = Array.from(document.querySelectorAll('button')).find((btn) => {
-                    const text = `${btn.innerText || ''} ${btn.getAttribute('aria-label') || ''}`;
-                    // Receive-only (transcribe) mode has no microphone, so Meet
-                    // shows a "Do you want people to hear you?" modal that OVERLAYS
-                    // the join button. Dismiss it via "Continue without microphone"
-                    // (and the older "don't use microphone" wording + RU variants),
-                    // but never match the affirmative "Use microphone" button.
-                    return /don't use microphone|do not use microphone|continue without microphone|не включать микрофон|продолжить без микрофона|без микрофона/i.test(text);
-                  });
-                  if (b) { b.click(); return true; }
-                  return false;
+                  const click = (rx) => {
+                    const b = Array.from(document.querySelectorAll('button')).find((btn) => {
+                      const text = `${btn.innerText || ''} ${btn.getAttribute('aria-label') || ''}`;
+                      return rx.test(text);
+                    });
+                    if (b) { b.click(); return true; }
+                    return false;
+                  };
+                  // Receive-only (transcribe) mode has no microphone, so Meet
+                  // shows a "Do you want people to hear you?" modal that OVERLAYS
+                  // the join button. Dismiss it via "Continue without microphone"
+                  // (and the older "don't use microphone" wording + RU variants),
+                  // but never match the affirmative "Use microphone" button.
+                  click(/don't use microphone|do not use microphone|continue without microphone|не включать микрофон|продолжить без микрофона|без микрофона/i);
+                  // Dismiss onboarding tooltips ("Got it" / "Понятно") that can
+                  // cover the join controls (e.g. the "Switch here" coachmark).
+                  click(/^\s*got it\s*$|^\s*понятно\s*$/i);
+                  return true;
                 }
                 """
             )
@@ -1083,6 +1101,9 @@ def _click_join(page, state: _BotState) -> bool:
                     { rx: /^Join now$/i, waitsForLobby: false },
                     { rx: /^Ask to join$/i, waitsForLobby: true },
                     { rx: /^Присоединиться$/i, waitsForLobby: false },
+                    // Not anchored: the button's innerText is prefixed with the
+                    // material-icon ligature, e.g. "add_to_queueJoin here".
+                    { rx: /join here/i, waitsForLobby: false },
                   ];
                   for (const b of Array.from(document.querySelectorAll('button'))) {
                     const inner = (b.innerText || '').trim();
