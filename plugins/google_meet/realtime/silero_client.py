@@ -1,15 +1,15 @@
-"""Local Silero TTS speaker — drop-in for ``RealtimeSession`` (alt to Piper).
+"""Local Silero TTS speaker — drop-in TTS speaker for ``RealtimeSession`.
 
 Silero (snakers4/silero-models) is a community-favorite Russian TTS: runs on
-CPU (no GPU), free, with several natural voices. Like the Piper adapter it only
+CPU (no GPU), free, with several natural voices. Like the TTS adapter it only
 needs to append raw s16le PCM to ``speaker.pcm``; the pump/null-sink/fake-mic
 chain is unchanged. Selected via HERMES_MEET_TTS=silero.
 
 NOTE on licensing: the Silero *model* weights carry their own (non-MIT) license
-— fine for evaluation; verify terms before commercial use. Piper (MIT) remains
+— fine for evaluation; verify terms before commercial use. MIT remains
 the default for that reason.
 
-Surface mirrors PiperSpeaker: connect / speak / cancel_response / close, plus
+Surface mirrors TTS interface: connect / speak / cancel_response / close, plus
 sample_rate / audio_bytes_out / last_audio_out_at.
 """
 

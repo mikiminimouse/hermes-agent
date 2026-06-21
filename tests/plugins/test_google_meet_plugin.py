@@ -1219,16 +1219,3 @@ def test_detect_admission_has_lobby_guard():
     assert "впуст" in src  # RU lobby copy stem
 
 
-def test_piper_speaker_is_realtime_session_dropin():
-    # PiperSpeaker must expose the same surface meet_bot/RealtimeSpeaker use.
-    from plugins.google_meet.realtime.piper_client import PiperSpeaker, _split_sentences
-    for attr in ("connect", "speak", "cancel_response", "close"):
-        assert callable(getattr(PiperSpeaker, attr)), attr
-    sp = PiperSpeaker(audio_sink_path=None, voice="ru_RU-dmitri-medium")
-    assert hasattr(sp, "sample_rate") and hasattr(sp, "audio_bytes_out")
-    assert sp.audio_bytes_out == 0 and sp.last_audio_out_at is None
-    # cancel flag is independent of a loaded voice
-    assert sp.cancel_response() is True
-    # sentence splitter feeds first-audio-after-first-sentence streaming
-    assert _split_sentences("Привет. Как дела? Хорошо!") == ["Привет.", "Как дела?", "Хорошо!"]
-    assert _split_sentences("") == []

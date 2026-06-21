@@ -454,9 +454,9 @@ def _start_realtime_speaker(
         state.set(error=f"realtime import failed: {e}")
         return
 
-    # TTS backend selection. Default = OpenAI Realtime (original). "piper" uses
-    # a self-hosted, open-weights, $0-per-token local voice (raw PCM, no
-    # transcode) — same downstream pump/sink/fake-mic chain.
+    # TTS backend selection. Default = OpenAI Realtime (original). "silero" uses
+    # a self-hosted, open-weights local voice (raw PCM, no transcode) — same
+    # downstream pump/sink/fake-mic chain.
     tts_backend = os.environ.get("HERMES_MEET_TTS", "").strip().lower()
 
     pcm_path = out_dir / SAY_PCM_FILENAME
@@ -469,16 +469,7 @@ def _start_realtime_speaker(
     queue_path.touch()
 
     try:
-        if tts_backend == "piper":
-            from plugins.google_meet.realtime.piper_client import PiperSpeaker
-            piper_voice = os.environ.get("HERMES_MEET_PIPER_VOICE", "").strip() or None
-            _ls = os.environ.get("HERMES_MEET_PIPER_LENGTH_SCALE", "").strip()
-            session = PiperSpeaker(
-                audio_sink_path=pcm_path,
-                voice=piper_voice,
-                length_scale=float(_ls) if _ls else None,
-            )
-        elif tts_backend == "silero":
+        if tts_backend == "silero":
             from plugins.google_meet.realtime.silero_client import SileroSpeaker
             silero_voice = os.environ.get("HERMES_MEET_SILERO_VOICE", "").strip() or None
             _sr = os.environ.get("HERMES_MEET_SILERO_RATE", "").strip()
@@ -715,11 +706,11 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
         "speaker_thread": None,    # threading.Thread | None
         "speaker_stop": None,      # callable | None
     }
-    # Self-hosted Piper TTS needs no API key; OpenAI Realtime does.
+    # Self-hosted Silero TTS needs no API key; OpenAI Realtime does.
     _tts_backend = os.environ.get("HERMES_MEET_TTS", "").strip().lower()
     if rt["enabled"]:
-        if _tts_backend not in ("piper", "silero") and not realtime_api_key:
-            state.set(error="realtime mode requested but no API key in HERMES_MEET_REALTIME_KEY/OPENAI_API_KEY — falling back to transcribe (or set HERMES_MEET_TTS=piper)")
+        if _tts_backend not in ("silero",) and not realtime_api_key:
+            state.set(error="realtime mode requested but no API key in HERMES_MEET_REALTIME_KEY/OPENAI_API_KEY — falling back to transcribe (or set HERMES_MEET_TTS=silero)")
             rt["enabled"] = False
         else:
             try:
