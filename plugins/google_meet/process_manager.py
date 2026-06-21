@@ -166,6 +166,7 @@ def start(
         "HERMES_MEET_NO_SANDBOX",
         "HERMES_MEET_REQUIRE_AUTH",
         "HERMES_MEET_CAPTION_LANG",
+        "HERMES_MEET_LANG",
     ):
         _v = os.environ.get(_k)
         if _v:

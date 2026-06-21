@@ -670,6 +670,12 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
     if meet_proxy:
         chrome_args.append(f"--proxy-server={meet_proxy}")
         chrome_args.append("--proxy-bypass-list=127.0.0.1;localhost;[::1]")
+    # UI language (env-gated). HERMES_MEET_LANG=ru-RU forces Chrome's UI +
+    # Accept-Language so Meet renders Russian — exercises the RU button/label
+    # matchers. Unset => the profile's native locale (no behavior change).
+    meet_lang = os.environ.get("HERMES_MEET_LANG", "").strip()
+    if meet_lang:
+        chrome_args.append(f"--lang={meet_lang}")
     # Real-Chrome on a headless server typically needs the sandbox disabled
     # (no user namespace). Gate it so the default bundled-Chromium path is
     # untouched.
@@ -708,6 +714,8 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
             }
             if rt["enabled"]:
                 context_args["permissions"] = ["microphone", "camera"]
+            if meet_lang:
+                context_args["locale"] = meet_lang
             if user_data_dir:
                 # Persistent real-Chrome profile: the signed-in Google session
                 # lives in the profile itself, so no storage_state is needed.

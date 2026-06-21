@@ -29,6 +29,8 @@ export HERMES_MEET_REQUIRE_AUTH="1"
 # Caption language: Meet transcribes only the configured language (no
 # auto-detect), so set Russian for RU meetings.
 export HERMES_MEET_CAPTION_LANG="${HERMES_MEET_CAPTION_LANG:-Russian}"
+# Optional UI language for RU/EN testing (e.g. ru-RU). Default: profile native.
+[ -n "${HERMES_MEET_LANG:-}" ] && export HERMES_MEET_LANG
 
 if [ "$MODE_HEADED" = "headed" ]; then
   export HERMES_MEET_HEADED="1"
