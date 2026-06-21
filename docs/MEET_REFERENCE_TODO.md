@@ -50,12 +50,24 @@ durable in prod — see P0).
 - [ ] Multi-speaker name attribution (2+ humans speaking).
 - [ ] Guest mode on a guest-enabled meeting (anon join was blocked by policy).
 
+## P3 — Code quality / upstream audit
+- [ ] Сравнить нашу ветку с upstream (см. /tmp/audit_prompt.md):
+  - Какие расширения готовы для PR в NousResearch/hermes-agent?
+  - Какие нужны правки стиля / параметризации?
+  - Возможна ли интеграция как feature branch или нужен fork?
+  
 ## P3 — Polish
 - [ ] Add realtime deps to `install --realtime` / lazy_deps: piper-tts,
   torch (cpu), omegaconf, silero model (now manually installed in venv).
 - [ ] Silero smoothness: optional whole-utterance pre-synth / larger buffer
   (Silero RTF 0.77 vs Piper 0.064; paplay --latency-msec=250 already added).
 - [ ] Page-reload / disconnect recovery test.
+
+## P4 — MCP integration (future, not blocked)
+- [ ] Expose meet-bot control as MCP server (vs. current /tmp/meetctl.py + Bash).
+  Allows Claude Code / subagents to join/control/listen without shell wrappers.
+  Follows pattern of existing playwright-MCP, codex-MCP (same as hermes agent).
+  Deferred until bot is stable in prod (P0–P3).
 
 ## Decided / done
 - Default voice: ru eugene (Silero); Piper ruslan = lowest-latency MIT fallback.
