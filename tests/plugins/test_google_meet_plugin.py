@@ -1135,3 +1135,15 @@ def test_detect_admission_drops_dead_jsname_and_adds_ru():
     assert "call_end" in src             # locale-independent hangup ligature
     assert "убтитр" in src               # RU caption region aria stem
     assert 'jsname="YSxPC"' not in src   # dead legacy selector removed
+
+
+def test_detect_admission_has_lobby_guard():
+    import inspect
+    from plugins.google_meet.meet_bot import _detect_admission
+
+    src = inspect.getsource(_detect_admission)
+    # Lobby is identified by its "waiting for host" copy because the lobby
+    # hangup button shares aria "Leave call" with the in-call one.
+    assert "please wait until" in src.lower()
+    assert "asking to be let in" in src.lower()
+    assert "впуст" in src  # RU lobby copy stem

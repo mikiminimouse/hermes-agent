@@ -1085,9 +1085,15 @@ def _detect_admission(page) -> bool:
     probe = r"""
     (() => {
       const buttons = Array.from(document.querySelectorAll('button'));
-      // 1) In-call leave button by RU/EN aria text. NOTE: do NOT anchor on the
-      // 'call_end' ligature here — the LOBBY's cancel/hangup button also uses
-      // 'call_end', which would false-positive admission while still waiting.
+      // 0) LOBBY GUARD (must run first): the lobby's hangup button has the SAME
+      // aria "Leave call" + 'call_end' ligature as the in-call one, so the leave
+      // button cannot distinguish lobby from call. The lobby is identified by
+      // its "waiting for host" copy instead — if present, we are NOT admitted.
+      const body = document.body ? (document.body.innerText || '') : '';
+      if (/please wait until|asking to be let in|wait(ing)? for the host|you'?ll join the call when|подождите,? пока|вас впуст|ожидайте|организатор.*впуст|запрос на присоединение отправлен/i.test(body)) {
+        return false;
+      }
+      // 1) In-call leave button by RU/EN aria text.
       const leave = buttons.find((b) => {
         const text = `${b.innerText || ''} ${b.getAttribute('aria-label') || ''}`;
         return /leave call|leave meeting|покинуть видеовстреч|покинуть вызов|покинуть звон|выйти из вызова|выйти из звон/i.test(text);
