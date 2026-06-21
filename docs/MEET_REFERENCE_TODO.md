@@ -5,15 +5,16 @@ brain→Silero TTS→virtual mic). Default voice **eugene** (Silero). Transcribe
 gates A–F pass. ~20 commits live on branch `meet/locale-receive-only` (NOT yet
 durable in prod — see P0).
 
-## P0 — Durable deployment (blocks everything)
-- [ ] Our delta lives only on branch `meet/locale-receive-only`. Prod
-  `~/.hermes/hermes-agent` main is pristine upstream because `hermes update`
-  runs `git reset --hard origin/main` (main.py:8866) and WIPES local commits
-  (confirmed via reflog).
-- [ ] Fix: fork `NousResearch/hermes-agent` → set fork as `origin` (carry our
+## P0 — Durable deployment (blocks everything) — PRE-FORK FIXES ✅ DONE
+- [x] **3 blocking issues identified & fixed (commit 2033ca6b4):**
+  - Fix #1: Debug output gated under `HERMES_MEET_DEBUG_MODE` → no JSON pollution in prod stdout
+  - Fix #2: TTS env vars (HERMES_MEET_TTS, HERMES_MEET_PIPER_*, HERMES_MEET_SILERO_*) added to process_manager passthrough → Piper/Silero work in clean containers
+  - Fix #3: Cached `mode` variable used consistently (lines 847, 1516) → atomic realtime/transcribe decision
+- [ ] Create fork `NousResearch/hermes-agent` → set fork as `origin` (carry our
   delta on fork main), `upstream`=NousResearch. The updater already compares
   origin vs upstream — built for this layout. Then `reset --hard origin/main`
   restores OUR code.
+- [ ] Verify post-fork: `git log origin/main` shows our commits (2033ca6b4 + 23 prior)
 
 ## P1 — Auto meeting-end → auto-summary  ✅ DONE (on branch)
 - [x] Empty-meeting detection: `_detect_alone()` (RU+EN copy + participant
