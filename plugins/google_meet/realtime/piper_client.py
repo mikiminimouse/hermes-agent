@@ -30,7 +30,7 @@ from typing import Optional
 _VOICE_CACHE: dict = {}
 
 # Default Russian voice — meetings are in Russian. Piper ships native RU voices.
-DEFAULT_PIPER_VOICE = "ru_RU-dmitri-medium"
+DEFAULT_PIPER_VOICE = "ru_RU-denis-medium"
 
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?…])\s+|\n+")
 
