@@ -188,8 +188,9 @@ _CAPTION_OBSERVER_JS = r"""
   window.__hermesMeetQueue = [];
 
   const captionSelector = '[role="region"][aria-label*="aption" i], ' +
-                          'div[jsname="YSxPC"], ' +  // legacy
-                          'div[jsname="tgaKEf"]';    // current (Apr 2026)
+                          'div[jsname="dsyhDe"], ' +  // current (Jun 2026, verified)
+                          'div[jsname="YSxPC"], ' +   // legacy (dead)
+                          'div[jsname="tgaKEf"]';     // legacy (dead)
 
   function pushEntry(speaker, text) {
     if (!text || !text.trim()) return;
@@ -245,19 +246,28 @@ _CAPTION_OBSERVER_JS = r"""
 
 
 def _enable_captions_js() -> str:
-    """Return a small JS snippet that tries to click the 'Turn on captions' button.
+    """Return JS that turns on Meet's live captions.
 
-    Best-effort — Meet's caption toggle is keyboard-accessible via ``c``. We
-    dispatch that keystroke as a cheap fallback. Real click targeting is too
-    brittle to rely on.
+    Clicks the real toolbar button (``aria-label`` "Turn on captions" + RU
+    "Включить субтитры"), falling back to the ``c`` keyboard shortcut. The
+    button only exists *in-call*, so this must run after admission — in the
+    lobby it is a no-op. Idempotent: once captions are on the button reads
+    "Turn off captions" and no longer matches, so re-running won't toggle them
+    back off. Returns true if the button was found and clicked. The synthetic
+    ``c`` keystroke alone does not work in headless Chrome — hence the click.
     """
     return r"""
     (() => {
+      const btn = Array.from(document.querySelectorAll('button')).find((b) => {
+        const s = `${b.innerText || ''} ${b.getAttribute('aria-label') || ''}`;
+        return /turn on captions|включить субтитры/i.test(s);
+      });
+      if (btn) { btn.click(); return true; }
       const ev = new KeyboardEvent('keydown', {
         key: 'c', code: 'KeyC', keyCode: 67, which: 67, bubbles: true,
       });
       document.body.dispatchEvent(ev);
-      return true;
+      return false;
     })();
     """
 
@@ -530,6 +540,23 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
         chrome_args.insert(0, "--use-fake-ui-for-media-stream")
         if rt["bridge_info"] and rt["bridge_info"].get("platform") == "linux":
             chrome_env["PULSE_SOURCE"] = rt["bridge_info"].get("device_name", "")
+    # Egress proxy (env-gated). The Google session must be minted *and* used
+    # from the same network region — mixing RU-direct and DE-proxy exits gets
+    # the session invalidated server-side. Route Chrome through the DE proxy
+    # when HERMES_MEET_PROXY is set; bypass loopback so local IPC is direct.
+    meet_proxy = os.environ.get("HERMES_MEET_PROXY", "").strip()
+    if meet_proxy:
+        chrome_args.append(f"--proxy-server={meet_proxy}")
+        chrome_args.append("--proxy-bypass-list=127.0.0.1;localhost;[::1]")
+    # Real-Chrome on a headless server typically needs the sandbox disabled
+    # (no user namespace). Gate it so the default bundled-Chromium path is
+    # untouched.
+    if os.environ.get("HERMES_MEET_NO_SANDBOX", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        chrome_args.append("--no-sandbox")
 
     try:
         with sync_playwright() as pw:
@@ -562,6 +589,10 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
             if user_data_dir:
                 # Persistent real-Chrome profile: the signed-in Google session
                 # lives in the profile itself, so no storage_state is needed.
+                # Keep Chrome's *native* user-agent — overriding it to a fake
+                # Chrome/124 string after signing in with the real UA triggers
+                # Google's security re-check and invalidates the session.
+                context_args.pop("user_agent", None)
                 browser = None
                 context = pw.chromium.launch_persistent_context(
                     user_data_dir, **launch_kwargs, **context_args
@@ -619,12 +650,11 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
                 except Exception as e:
                     print(f"[meet_bot] join button debug failed: {e!r}", flush=True)
 
-            # Install caption observer and attempt to enable captions.
-            try:
-                page.evaluate(_enable_captions_js())
-                state.set(captions_enabled_attempted=True)
-            except Exception:
-                pass
+            # Install the caption observer now — it retries on an interval
+            # until the caption region appears. Enabling captions is DEFERRED
+            # until after admission (the "Turn on captions" button only exists
+            # in-call); doing it here, in the lobby, was a silent no-op and the
+            # root cause of empty transcripts.
             try:
                 page.evaluate(_CAPTION_OBSERVER_JS)
             except Exception as e:
@@ -668,6 +698,7 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
                 os.environ.get("HERMES_MEET_LOBBY_TIMEOUT", "300")
             )
             last_admission_check = 0.0
+            captions_enable_attempts = 0
             while not stop_flag["stop"]:
                 now = time.time()
                 if deadline and now > deadline:
@@ -699,6 +730,18 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
                             leave_reason="denied",
                         )
                         break
+
+                # Captions can only be turned on in-call, so enable them after
+                # admission. Retry a handful of times (~1s apart) because the
+                # toolbar settles a beat after the lobby clears; the call is
+                # idempotent once captions are on.
+                if state.in_call and captions_enable_attempts < 8:
+                    captions_enable_attempts += 1
+                    try:
+                        page.evaluate(_enable_captions_js())
+                        state.set(captions_enabled_attempted=True)
+                    except Exception:
+                        pass
 
                 try:
                     queued = page.evaluate("window.__hermesMeetDrain && window.__hermesMeetDrain()")
@@ -1006,7 +1049,12 @@ def _click_join(page, state: _BotState) -> bool:
                 () => {
                   const b = Array.from(document.querySelectorAll('button')).find((btn) => {
                     const text = `${btn.innerText || ''} ${btn.getAttribute('aria-label') || ''}`;
-                    return /don't use microphone|do not use microphone|не включать микрофон/i.test(text);
+                    // Receive-only (transcribe) mode has no microphone, so Meet
+                    // shows a "Do you want people to hear you?" modal that OVERLAYS
+                    // the join button. Dismiss it via "Continue without microphone"
+                    // (and the older "don't use microphone" wording + RU variants),
+                    // but never match the affirmative "Use microphone" button.
+                    return /don't use microphone|do not use microphone|continue without microphone|не включать микрофон|продолжить без микрофона|без микрофона/i.test(text);
                   });
                   if (b) { b.click(); return true; }
                   return false;
