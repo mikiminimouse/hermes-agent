@@ -154,6 +154,32 @@ def start(
         env["HERMES_MEET_REALTIME_INSTRUCTIONS"] = realtime_instructions
     if realtime_api_key:
         env["HERMES_MEET_REALTIME_KEY"] = realtime_api_key
+    # Real-Chrome / persistent-profile passthrough. These are inherited via
+    # os.environ.copy() above, but we forward them explicitly so the bot's
+    # browser-engine contract is visible at the spawn site and survives any
+    # future change to how `env` is built. Unset => bot uses bundled Chromium.
+    # Default TTS backend is Silero (self-hosted, no API key).
+    for _k in (
+        "HERMES_MEET_CHROME_CHANNEL",
+        "HERMES_MEET_CHROME_PATH",
+        "HERMES_MEET_USER_DATA_DIR",
+        "HERMES_MEET_PROXY",
+        "HERMES_MEET_NO_SANDBOX",
+        "HERMES_MEET_REQUIRE_AUTH",
+        "HERMES_MEET_CAPTION_LANG",
+        "HERMES_MEET_LANG",
+        "HERMES_MEET_LEAVE_WHEN_ALONE",
+        "HERMES_MEET_ALONE_TIMEOUT",
+        "HERMES_MEET_SUMMARY_CMD",
+        "HERMES_MEET_TTS",
+        "HERMES_MEET_SILERO_VOICE",
+        "HERMES_MEET_SILERO_RATE",
+    ):
+        _v = os.environ.get(_k)
+        if _k == "HERMES_MEET_TTS" and not _v:
+            _v = "silero"
+        if _v:
+            env[_k] = _v
 
     log_path = out / "bot.log"
     # Detach: stdin=devnull, stdout/stderr → log file, new session so parent

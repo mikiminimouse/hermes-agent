@@ -172,6 +172,36 @@ class _BotState:
             setattr(self, k, v)
         self._flush()
 
+    # -------- end-of-meeting summary signal ----------------------------
+
+    def request_summary(self) -> Optional["Path"]:
+        """Drop a ``summary_request.json`` marker in the meeting dir.
+
+        Written only when the meeting was actually attended and has content
+        (so denied/lobby-timeout never request a summary). This file is the
+        contract a post-call summarizer watches for: the bot never runs the
+        LLM itself (it has no model/key) — an external hook or the Hermes
+        agent picks up the marker and produces ``report.md``. Returns the
+        marker path, or None if there was nothing to summarize.
+        """
+        if self.joined_at is None or self.transcript_lines <= 0:
+            return None
+        marker = self.out_dir / "summary_request.json"
+        payload = {
+            "meetingId": self.meeting_id,
+            "url": self.url,
+            "transcriptPath": str(self.transcript_path),
+            "transcriptLines": self.transcript_lines,
+            "leaveReason": self.leave_reason,
+            "endedAt": time.time(),
+            "reportPath": str(self.out_dir / "report.md"),
+            "status": "pending",
+        }
+        tmp = marker.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp.replace(marker)
+        return marker
+
 
 # ---------------------------------------------------------------------------
 # Playwright bot entry point
@@ -187,12 +217,19 @@ _CAPTION_OBSERVER_JS = r"""
   window.__hermesMeetInstalled = true;
   window.__hermesMeetQueue = [];
 
+  // The caption region's DOM node is recreated by Meet (when captions toggle,
+  // settings open/close, or speech starts), which orphans a MutationObserver
+  // bound to a single node. So we observe document.body and RE-QUERY the
+  // current caption region on every mutation — robust against node swaps.
   const captionSelector = '[role="region"][aria-label*="aption" i], ' +
-                          'div[jsname="YSxPC"], ' +  // legacy
-                          'div[jsname="tgaKEf"]';    // current (Apr 2026)
+                          'div[jsname="dsyhDe"]';  // current (Jun 2026, verified)
 
+  let lastKey = '';
   function pushEntry(speaker, text) {
     if (!text || !text.trim()) return;
+    const key = (speaker || '') + '\x1f' + text.trim();
+    if (key === lastKey) return;  // collapse consecutive identical scans
+    lastKey = key;
     window.__hermesMeetQueue.push({
       ts: Date.now(),
       speaker: (speaker || '').trim(),
@@ -200,40 +237,25 @@ _CAPTION_OBSERVER_JS = r"""
     });
   }
 
-  function scan(root) {
-    // Meet captions render as a list of rows; each row contains a speaker
-    // label and a text block. Selectors vary across Meet rewrites; we try
-    // a few shapes and fall back to raw text.
-    const rows = root.querySelectorAll('div[jsname="dsyhDe"], div.CNusmb, div.TBMuR');
-    if (rows.length) {
-      rows.forEach((row) => {
-        const spkEl = row.querySelector('div.KcIKyf, div.zs7s8d, span[jsname="YSxPC"]');
-        const txtEl = row.querySelector('div.bh44bd, span[jsname="tgaKEf"], div.iTTPOb');
-        const speaker = spkEl ? spkEl.innerText : '';
-        const text = txtEl ? txtEl.innerText : row.innerText;
-        pushEntry(speaker, text);
-      });
-      return;
-    }
-    // Fallback: treat the whole region's innerText as one anonymous line.
-    const text = (root.innerText || '').split('\n').filter(Boolean).pop();
-    pushEntry('', text);
+  function scan() {
+    const root = document.querySelector(captionSelector);
+    if (!root) return;
+    // Each caption row carries a speaker label then the spoken text. Old class
+    // selectors drift across Meet rewrites, so split the row/region innerText:
+    // line 1 = speaker, the rest = text. Falls back to the whole region.
+    const rows = root.querySelectorAll('div[jsname="dsyhDe"]');
+    const targets = (rows && rows.length) ? rows : [root];
+    targets.forEach((row) => {
+      const lines = (row.innerText || '').split('\n').map((s) => s.trim()).filter(Boolean);
+      if (!lines.length) return;
+      if (lines.length === 1) pushEntry('', lines[0]);
+      else pushEntry(lines[0], lines.slice(1).join(' '));
+    });
   }
 
-  function attach() {
-    const el = document.querySelector(captionSelector);
-    if (!el) return false;
-    const obs = new MutationObserver(() => scan(el));
-    obs.observe(el, { childList: true, subtree: true, characterData: true });
-    scan(el);
-    return true;
-  }
-
-  // Try now and retry on interval — the caption region only appears after
-  // captions are enabled and someone speaks.
-  if (!attach()) {
-    const iv = setInterval(() => { if (attach()) clearInterval(iv); }, 1500);
-  }
+  const obs = new MutationObserver(() => scan());
+  obs.observe(document.body, { childList: true, subtree: true, characterData: true });
+  scan();
 
   window.__hermesMeetDrain = () => {
     const out = window.__hermesMeetQueue.slice();
@@ -245,21 +267,161 @@ _CAPTION_OBSERVER_JS = r"""
 
 
 def _enable_captions_js() -> str:
-    """Return a small JS snippet that tries to click the 'Turn on captions' button.
+    """Return JS that turns on Meet's live captions.
 
-    Best-effort — Meet's caption toggle is keyboard-accessible via ``c``. We
-    dispatch that keystroke as a cheap fallback. Real click targeting is too
-    brittle to rely on.
+    Locale-independent + state-aware. Primary anchor is the material-icon
+    ligature ``closed_caption_off`` (captions currently OFF) which is identical
+    in every UI language; falls back to text ("Turn on captions" / RU "Включить
+    субтитры") then the ``c`` keystroke. Idempotent: only clicks when captions
+    are OFF — once ON the button shows ``closed_caption`` / "Turn off", which is
+    left alone, so re-running never toggles captions back off. The button only
+    exists *in-call*, so this is a no-op in the lobby. Returns true if it
+    clicked. The synthetic ``c`` keystroke alone does not work headless.
     """
     return r"""
     (() => {
+      const buttons = Array.from(document.querySelectorAll('button'));
+      const off = buttons.find((b) => {
+        const inner = b.innerText || '';
+        const s = inner + ' ' + (b.getAttribute('aria-label') || '');
+        return /closed_caption_off/i.test(inner)
+          || /turn on captions|включить субтитры/i.test(s);
+      });
+      if (off) { off.click(); return true; }
+      // Already on? (ligature 'closed_caption' without _off, or "turn off")
+      const on = buttons.some((b) => {
+        const inner = b.innerText || '';
+        const s = inner + ' ' + (b.getAttribute('aria-label') || '');
+        return /closed_caption(?!_off)/i.test(inner)
+          || /turn off captions|выключить субтитры|отключить субтитры/i.test(s);
+      });
+      if (on) return false;
       const ev = new KeyboardEvent('keydown', {
         key: 'c', code: 'KeyC', keyCode: 67, which: 67, bubbles: true,
       });
       document.body.dispatchEvent(ev);
-      return true;
+      return false;
     })();
     """
+
+
+def _set_caption_language(page, lang: str) -> bool:
+    """Open caption settings and set the meeting/caption language.
+
+    Robust to the settings UI being in RU or EN. Meet transcribes ONLY the
+    configured language (no auto-detect), so transcribe mode must set it or the
+    caption region stays empty. Opens Settings → Captions (caption-settings text
+    in RU/EN, else the ``settings`` gear ligature), opens the "Language of the
+    meeting" combobox (ARIA role, preferring one whose name mentions
+    language/язык when several exist), and selects the Russian option by its
+    localized label — "Russian" in EN UI, "Русский" in RU UI — matched
+    independently of the configured value so captions always end up Russian. The
+    configured *lang* is re.escaped and added as an extra alias. Best-effort;
+    returns True only when an option was selected. Closes via the dialog's close
+    control (Escape fallback) so it doesn't cover the caption region.
+    """
+    def _log(msg: str) -> None:
+        try:
+            print(f"[meet_bot] caption-language: {msg}", flush=True)
+        except Exception:
+            pass
+
+    # The language picker lives ONLY in the caption-settings dialog reached via
+    # the caption overlay's "Open caption settings" button — that entry opens
+    # Settings directly on the Captions section with the "Language of the
+    # meeting" combobox. The generic ⋮ → Settings dialog has NO Captions tab, so
+    # it is a dead end. The button appears a beat after captions are enabled, so
+    # retry briefly (RU/EN text).
+    opened_settings = False
+    for _ in range(6):
+        try:
+            opened_settings = bool(page.evaluate(
+                r"""()=>{const bs=[...document.querySelectorAll('button,[role="button"]')];
+                  const t=bs.find(x=>/open caption settings|(настройки|параметры) субтитров/i
+                    .test((x.innerText||'')+' '+(x.getAttribute('aria-label')||'')));
+                  if(t){t.click();return true;} return false;}"""
+            ))
+        except Exception:
+            opened_settings = False
+        if opened_settings:
+            break
+        try:
+            page.wait_for_timeout(1000)
+        except Exception:
+            pass
+    if not opened_settings:
+        _log("'open caption settings' not available (captions overlay not up yet)")
+        return False
+    try:
+        page.wait_for_timeout(1200)
+    except Exception:
+        pass
+
+    # Always select Russian; also accept the configured label (escaped) as alias.
+    safe = re.escape((lang or "").strip())
+    ru_pat = r"^\s*(russian|русск" + (("|" + safe) if safe else "") + r")"
+    rx_ru = re.compile(ru_pat, re.I)
+
+    # Open the language combobox (role anchor; prefer a language/язык-named one).
+    # The dialog renders asynchronously, so poll a few times (count() is instant)
+    # before giving up rather than checking once too early.
+    opened = False
+    for _ in range(5):
+        try:
+            named = page.get_by_role("combobox", name=re.compile(r"language|язык", re.I))
+            if named.count():
+                named.first.click(timeout=2_000)
+                opened = True
+                break
+            any_cb = page.get_by_role("combobox")
+            if any_cb.count():
+                any_cb.first.click(timeout=2_000)
+                opened = True
+                break
+        except Exception as e:
+            _log(f"combobox open error: {e}")
+        try:
+            page.wait_for_timeout(800)
+        except Exception:
+            pass
+    if not opened:
+        _log("language combobox not found (settings/Captions tab not open)")
+        return False
+    try:
+        page.wait_for_timeout(800)
+    except Exception:
+        pass
+
+    selected = False
+    try:
+        opt = page.get_by_role("option", name=rx_ru).first
+        if opt.count():
+            opt.click(timeout=3_000)
+            selected = True
+    except Exception as e:
+        _log(f"option select failed: {e}")
+        selected = False
+    if not selected:
+        _log("russian option not found")
+
+    # Close settings via its close control; Escape only as a fallback.
+    try:
+        closed = page.evaluate(
+            r"""()=>{
+              const b=[...document.querySelectorAll('button,[role="button"]')].find(x=>
+                (x.innerText||'').trim()==='close'
+                || /^(close|закрыть)$/i.test(x.getAttribute('aria-label')||''));
+              if(b){b.click();return true;} return false;
+            }"""
+        )
+    except Exception:
+        closed = False
+    if not closed:
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+    return selected
 
 
 def _start_realtime_speaker(
@@ -292,6 +454,11 @@ def _start_realtime_speaker(
         state.set(error=f"realtime import failed: {e}")
         return
 
+    # TTS backend selection. Default = Silero (self-hosted, open-weights local voice).
+    # Raw PCM, no transcode — same downstream pump/sink/fake-mic chain.
+    # Set HERMES_MEET_TTS=openai to use OpenAI Realtime instead.
+    tts_backend = os.environ.get("HERMES_MEET_TTS", "").strip().lower()
+
     pcm_path = out_dir / SAY_PCM_FILENAME
     queue_path = out_dir / SAY_QUEUE_FILENAME
     processed_path = out_dir / "say_processed.jsonl"
@@ -302,17 +469,27 @@ def _start_realtime_speaker(
     queue_path.touch()
 
     try:
-        session = RealtimeSession(
-            api_key=api_key,
-            model=model,
-            voice=voice,
-            instructions=instructions,
-            audio_sink_path=pcm_path,
-            sample_rate=24000,
-        )
+        if tts_backend == "silero":
+            from plugins.google_meet.realtime.silero_client import SileroSpeaker
+            silero_voice = os.environ.get("HERMES_MEET_SILERO_VOICE", "").strip() or None
+            _sr = os.environ.get("HERMES_MEET_SILERO_RATE", "").strip()
+            session = SileroSpeaker(
+                audio_sink_path=pcm_path,
+                voice=silero_voice,
+                sample_rate=int(_sr) if _sr else 48000,
+            )
+        else:
+            session = RealtimeSession(
+                api_key=api_key,
+                model=model,
+                voice=voice,
+                instructions=instructions,
+                audio_sink_path=pcm_path,
+                sample_rate=24000,
+            )
         session.connect()
     except Exception as e:
-        state.set(error=f"realtime connect failed: {e}")
+        state.set(error=f"realtime connect failed ({tts_backend or 'openai_realtime'}): {e}")
         return
 
     rt["session"] = session
@@ -347,22 +524,56 @@ def _start_realtime_speaker(
         import subprocess as _sp
 
         sink = (bridge_info or {}).get("write_target") or "hermes_meet_sink"
+        rate = getattr(session, "sample_rate", 24000)
         try:
+            # paplay reads stdin (no file arg) and a tailer thread streams the
+            # GROWING speaker.pcm into it. Passing the file path directly would
+            # make paplay read to EOF once and exit — but speaker.pcm starts
+            # empty and is appended to as TTS synthesizes, so paplay would quit
+            # before any audio existed (silent call). Tailing keeps it live.
             proc = _sp.Popen(
                 [
                     "paplay",
                     "--raw",
-                    "--rate=24000",
+                    f"--rate={rate}",
                     "--format=s16le",
                     "--channels=1",
                     f"--device={sink}",
-                    str(pcm_path),
+                    # Buffer ~250ms so brief gaps between the tailer's PCM writes
+                    # (sentence boundaries / EOF polls) don't underrun the sink
+                    # and cause occasional audible stutter. Cheap latency for
+                    # smooth playback; far less than the Meet caption lag anyway.
+                    "--latency-msec=250",
                 ],
-                stdin=_sp.DEVNULL,
+                stdin=_sp.PIPE,
                 stdout=_sp.DEVNULL,
                 stderr=_sp.DEVNULL,
             )
             rt["pcm_pump"] = proc
+
+            def _pcm_tailer():
+                try:
+                    with open(pcm_path, "rb") as fh:
+                        while not stop_flag.get("stop"):
+                            chunk = fh.read(4096)
+                            if chunk:
+                                try:
+                                    proc.stdin.write(chunk)
+                                    proc.stdin.flush()
+                                except Exception:
+                                    break
+                            else:
+                                time.sleep(0.05)
+                except Exception:
+                    pass
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+
+            _tt = threading.Thread(target=_pcm_tailer, name="meet-pcm-tail", daemon=True)
+            _tt.start()
+            rt["pcm_tail"] = _tt
         except FileNotFoundError:
             state.set(error="paplay not found — install pulseaudio-utils for realtime on Linux")
     elif platform_tag == "darwin":
@@ -392,7 +603,7 @@ def _start_realtime_speaker(
                         "ffmpeg",
                         "-nostdin", "-hide_banner", "-loglevel", "error",
                         "-re",
-                        "-f", "s16le", "-ar", "24000", "-ac", "1",
+                        "-f", "s16le", "-ar", str(getattr(session, 'sample_rate', 24000)), "-ac", "1",
                         "-i", str(pcm_path),
                         "-f", "audiotoolbox",
                         "-audio_device_index", _mac_audio_device_index(device_name),
@@ -495,9 +706,12 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
         "speaker_thread": None,    # threading.Thread | None
         "speaker_stop": None,      # callable | None
     }
+    # The bot uses Silero TTS for realtime voice synthesis (no API key needed).
+    # Set HERMES_MEET_TTS=openai to switch to OpenAI Realtime (requires API key).
+    _tts_backend = os.environ.get("HERMES_MEET_TTS", "").strip().lower()
     if rt["enabled"]:
-        if not realtime_api_key:
-            state.set(error="realtime mode requested but no API key in HERMES_MEET_REALTIME_KEY/OPENAI_API_KEY — falling back to transcribe")
+        if _tts_backend == "openai" and not realtime_api_key:
+            state.set(error="OpenAI realtime TTS requested but no API key in HERMES_MEET_REALTIME_KEY/OPENAI_API_KEY — falling back to transcribe mode")
             rt["enabled"] = False
         else:
             try:
@@ -522,19 +736,37 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
             rt["bridge"].teardown()
         return 3
 
-    # Chrome env: if realtime is live on Linux, point PULSE_SOURCE at the
-    # virtual source so Chrome's fake mic reads the audio we generate.
+    # Chrome env: only realtime mode needs an input device. Transcribe mode is
+    # receive-only and must not publish Chromium's fake microphone tone into Meet.
     chrome_env = os.environ.copy()
-    chrome_args = [
-        "--use-fake-ui-for-media-stream",
-        "--disable-blink-features=AutomationControlled",
-    ]
-    if not rt["enabled"]:
-        # v1-style fake device (silence) — we don't care about mic content
-        # when we're not speaking.
-        chrome_args.insert(1, "--use-fake-device-for-media-stream")
-    elif rt["bridge_info"] and rt["bridge_info"].get("platform") == "linux":
-        chrome_env["PULSE_SOURCE"] = rt["bridge_info"].get("device_name", "")
+    chrome_args = ["--disable-blink-features=AutomationControlled"]
+    if rt["enabled"]:
+        chrome_args.insert(0, "--use-fake-ui-for-media-stream")
+        if rt["bridge_info"] and rt["bridge_info"].get("platform") == "linux":
+            chrome_env["PULSE_SOURCE"] = rt["bridge_info"].get("device_name", "")
+    # Egress proxy (env-gated). The Google session must be minted *and* used
+    # from the same network region — mixing RU-direct and DE-proxy exits gets
+    # the session invalidated server-side. Route Chrome through the DE proxy
+    # when HERMES_MEET_PROXY is set; bypass loopback so local IPC is direct.
+    meet_proxy = os.environ.get("HERMES_MEET_PROXY", "").strip()
+    if meet_proxy:
+        chrome_args.append(f"--proxy-server={meet_proxy}")
+        chrome_args.append("--proxy-bypass-list=127.0.0.1;localhost;[::1]")
+    # UI language (env-gated). HERMES_MEET_LANG=ru-RU forces Chrome's UI +
+    # Accept-Language so Meet renders Russian — exercises the RU button/label
+    # matchers. Unset => the profile's native locale (no behavior change).
+    meet_lang = os.environ.get("HERMES_MEET_LANG", "").strip()
+    if meet_lang:
+        chrome_args.append(f"--lang={meet_lang}")
+    # Real-Chrome on a headless server typically needs the sandbox disabled
+    # (no user namespace). Gate it so the default bundled-Chromium path is
+    # untouched.
+    if os.environ.get("HERMES_MEET_NO_SANDBOX", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        chrome_args.append("--no-sandbox")
 
     try:
         with sync_playwright() as pw:
@@ -542,22 +774,91 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
             # via the process env before launch so the child Chrome inherits it.
             for k, v in chrome_env.items():
                 os.environ[k] = v
-            browser = pw.chromium.launch(
-                headless=not headed,
-                args=chrome_args,
-            )
+            # Browser engine selection (env-gated; default = bundled Chromium,
+            # unchanged behavior). Real Chrome + a persistent profile is the
+            # robust path against Google's "this browser may not be secure"
+            # automation block. executable_path and channel are mutually
+            # exclusive in Playwright, so prefer an explicit path when given.
+            chrome_channel = os.environ.get("HERMES_MEET_CHROME_CHANNEL", "").strip()
+            chrome_path = os.environ.get("HERMES_MEET_CHROME_PATH", "").strip()
+            user_data_dir = os.environ.get("HERMES_MEET_USER_DATA_DIR", "").strip()
+            launch_kwargs = {"headless": not headed, "args": chrome_args}
+            if chrome_path:
+                launch_kwargs["executable_path"] = chrome_path
+            elif chrome_channel:
+                launch_kwargs["channel"] = chrome_channel
             context_args = {
                 "viewport": {"width": 1280, "height": 800},
                 "user_agent": (
                     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
                 ),
-                "permissions": ["microphone", "camera"],
             }
-            if auth_state and Path(auth_state).is_file():
-                context_args["storage_state"] = auth_state
-            context = browser.new_context(**context_args)
-            page = context.new_page()
+            if rt["enabled"]:
+                context_args["permissions"] = ["microphone", "camera"]
+            if meet_lang:
+                context_args["locale"] = meet_lang
+            if user_data_dir:
+                # Persistent real-Chrome profile: the signed-in Google session
+                # lives in the profile itself, so no storage_state is needed.
+                # Keep Chrome's *native* user-agent — overriding it to a fake
+                # Chrome/124 string after signing in with the real UA triggers
+                # Google's security re-check and invalidates the session.
+                context_args.pop("user_agent", None)
+                browser = None
+                context = pw.chromium.launch_persistent_context(
+                    user_data_dir, **launch_kwargs, **context_args
+                )
+                page = context.pages[0] if context.pages else context.new_page()
+            else:
+                if auth_state and Path(auth_state).is_file():
+                    context_args["storage_state"] = auth_state
+                browser = pw.chromium.launch(**launch_kwargs)
+                context = browser.new_context(**context_args)
+                page = context.new_page()
+
+            # Optional auth gate (reference authed flow). Off by default so the
+            # guest / storage_state smoke paths are unaffected. When required,
+            # fail fast with a clear reason instead of silently landing on
+            # Google's "browser may not be secure" page mid-join.
+            if os.environ.get("HERMES_MEET_REQUIRE_AUTH", "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+            ):
+                authed, reason = _auth_gate(page)
+                if not authed:
+                    state.set(error=f"auth gate failed: {reason}", exited=True)
+                    return 4
+
+            # Realtime: force mic capture constraints before Meet's JS runs, so
+            # Chrome/Meet don't apply echo-cancellation / noise-suppression /
+            # auto-gain that suppress our steady loopback (virtual-mic) audio as
+            # "noise". Best-effort: Chrome may keep some processing, but this
+            # removes the constraint-driven suppression of synthetic speech.
+            if mode == "realtime":
+                try:
+                    page.add_init_script(
+                        """(() => {
+                          const md = navigator.mediaDevices;
+                          if (!md || !md.getUserMedia) return;
+                          const orig = md.getUserMedia.bind(md);
+                          md.getUserMedia = (c) => {
+                            c = c || {};
+                            if (c.audio) {
+                              const a = (typeof c.audio === 'object') ? c.audio : {};
+                              c.audio = Object.assign({}, a, {
+                                echoCancellation: false,
+                                noiseSuppression: false,
+                                autoGainControl: false,
+                              });
+                            }
+                            return orig(c);
+                          };
+                        })();"""
+                    )
+                except Exception:
+                    pass
 
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=30_000)
@@ -568,14 +869,34 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
             # Guest-mode: Meet shows a name field before "Ask to join". When
             # we're authed, we instead see "Join now".
             _try_guest_name(page, guest_name)
-            _click_join(page, state)
+            join_clicked = _click_join(page, state)
+            if not join_clicked:
+                if os.environ.get('HERMES_MEET_DEBUG_MODE', '').lower() in ('1', 'true', 'yes'):
+                    try:
+                        debug = page.evaluate(
+                            r"""
+                            () => ({
+                              url: location.href,
+                              text: (document.body && document.body.innerText || '').slice(0, 2000),
+                              buttons: Array.from(document.querySelectorAll('button')).map((b, i) => ({
+                                i,
+                                inner: (b.innerText || '').trim(),
+                                aria: (b.getAttribute('aria-label') || '').trim(),
+                                visible: !!(b.offsetWidth || b.offsetHeight || b.getClientRects().length),
+                                disabled: b.disabled || b.getAttribute('aria-disabled') === 'true',
+                              })).filter((x) => x.visible),
+                            })
+                            """
+                        )
+                        print(f"[meet_bot] join button not clicked; continuing admission loop debug={debug!r}", flush=True)
+                    except Exception as e:
+                        print(f"[meet_bot] join button debug failed: {e!r}", flush=True)
 
-            # Install caption observer and attempt to enable captions.
-            try:
-                page.evaluate(_enable_captions_js())
-                state.set(captions_enabled_attempted=True)
-            except Exception:
-                pass
+            # Install the caption observer now — it retries on an interval
+            # until the caption region appears. Enabling captions is DEFERRED
+            # until after admission (the "Turn on captions" button only exists
+            # in-call); doing it here, in the lobby, was a silent no-op and the
+            # root cause of empty transcripts.
             try:
                 page.evaluate(_CAPTION_OBSERVER_JS)
             except Exception as e:
@@ -619,11 +940,45 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
                 os.environ.get("HERMES_MEET_LOBBY_TIMEOUT", "300")
             )
             last_admission_check = 0.0
+            last_caption_enable = 0.0
+            caption_lang = os.environ.get("HERMES_MEET_CAPTION_LANG", "").strip()
+            caption_lang_done = False
+            last_lang_try = 0.0
+            lang_attempts = 0
+            mic_unmute_attempts = 0
+            # Auto-end on empty meeting. Only arm AFTER the bot has seen company
+            # (≥2 participants) at least once — otherwise a bot that joins before
+            # the host would immediately "leave alone" in an empty room. Once
+            # everyone else has gone for HERMES_MEET_ALONE_TIMEOUT seconds, leave
+            # with leave_reason="alone" so the caller can trigger summarization.
+            leave_when_alone = os.environ.get(
+                "HERMES_MEET_LEAVE_WHEN_ALONE", "1"
+            ).strip().lower() not in ("0", "false", "no", "")
+            alone_timeout = float(os.environ.get("HERMES_MEET_ALONE_TIMEOUT", "90"))
+            ever_had_company = False
+            alone_since: Optional[float] = None
+            last_alone_check = 0.0
             while not stop_flag["stop"]:
                 now = time.time()
                 if deadline and now > deadline:
                     state.set(leave_reason="duration_expired")
                     break
+
+                # Realtime: once in-call, make sure the mic is UNMUTED — Meet can
+                # join muted, and a muted track means no one hears the TTS even
+                # though audio flows into the fake-mic. Idempotent: once unmuted
+                # the button reads "Turn off microphone" and no longer matches.
+                if rt["enabled"] and state.in_call and mic_unmute_attempts < 6:
+                    mic_unmute_attempts += 1
+                    try:
+                        page.evaluate(
+                            r"""()=>{const b=[...document.querySelectorAll('button')].find(x=>{
+                              const s=(x.innerText||'')+' '+(x.getAttribute('aria-label')||'');
+                              return /turn on microphone|включить микрофон/i.test(s);});
+                              if(b)b.click();}"""
+                        )
+                    except Exception:
+                        pass
 
                 # Admission detection every ~3s until admitted.
                 if not state.in_call and (now - last_admission_check) > 3.0:
@@ -635,6 +990,15 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
                             lobby_waiting=False,
                             joined_at=now,
                         )
+                    # Check denial BEFORE the timeout so a real host-denial isn't
+                    # misattributed as a lobby timeout (it would otherwise wait
+                    # the full window and report the wrong leave_reason).
+                    elif _detect_denied(page):
+                        state.set(
+                            error="host denied admission",
+                            leave_reason="denied",
+                        )
+                        break
                     elif now > lobby_deadline:
                         state.set(
                             error=(
@@ -644,12 +1008,63 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
                             leave_reason="lobby_timeout",
                         )
                         break
-                    elif _detect_denied(page):
-                        state.set(
-                            error="host denied admission",
-                            leave_reason="denied",
-                        )
-                        break
+
+                # Empty-meeting auto-end (throttled ~5s). _detect_alone is
+                # conservative (False on any ambiguity), so we additionally
+                # require the alone state to PERSIST for alone_timeout before
+                # leaving — a momentary tile-count blip won't end the call.
+                if leave_when_alone and state.in_call and (now - last_alone_check) > 5.0:
+                    last_alone_check = now
+                    alone = _detect_alone(page)
+                    if not alone:
+                        ever_had_company = True
+                        alone_since = None
+                    elif ever_had_company:
+                        if alone_since is None:
+                            alone_since = now
+                        elif (now - alone_since) >= alone_timeout:
+                            state.set(leave_reason="alone")
+                            break
+
+                # Captions can only be turned on in-call, so enable them after
+                # admission. Keep retrying (throttled ~3s) until captions
+                # actually produce lines — the caption button can settle several
+                # seconds after admission, and re-clicking is idempotent (once
+                # on, the button reads "Turn off captions" and no longer
+                # matches the "Turn on" regex).
+                if (
+                    state.in_call
+                    and state.transcript_lines == 0
+                    and (now - last_caption_enable) > 3.0
+                ):
+                    last_caption_enable = now
+                    try:
+                        page.evaluate(_enable_captions_js())
+                        state.set(captions_enabled_attempted=True)
+                    except Exception:
+                        pass
+
+                # Force the caption language (env-gated; runner sets Russian).
+                # Decoupled from the transcript gate above: the caption-settings
+                # entry only appears once the caption overlay has rendered, which
+                # can be after the first lines arrive — so retry on its own
+                # cadence after admission until it succeeds or we exhaust tries.
+                # This is belt-and-suspenders: the language is ALSO sticky in the
+                # persistent Chrome profile, which is the primary guarantee.
+                if (
+                    caption_lang
+                    and state.in_call
+                    and not caption_lang_done
+                    and lang_attempts < 12
+                    and (now - last_lang_try) > 3.0
+                ):
+                    last_lang_try = now
+                    lang_attempts += 1
+                    try:
+                        if _set_caption_language(page, caption_lang):
+                            caption_lang_done = True
+                    except Exception:
+                        pass
 
                 try:
                     queued = page.evaluate("window.__hermesMeetDrain && window.__hermesMeetDrain()")
@@ -688,17 +1103,27 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
 
                 time.sleep(1.0)
 
-            # Try to leave cleanly — click "Leave call" button if present.
+            # Try to leave cleanly — click the hangup button if present. Anchor
+            # on the locale-independent 'call_end' icon ligature first, then
+            # RU/EN aria text, so this works whether the UI is English or
+            # Russian (the old aria*="eave call" was English-only).
             try:
                 page.evaluate(
-                    "() => { const b = document.querySelector('button[aria-label*=\"eave call\"]');"
-                    " if (b) b.click(); }"
+                    r"""() => {
+                      const b = [...document.querySelectorAll('button')].find((x) => {
+                        const t = (x.innerText || '') + ' ' + (x.getAttribute('aria-label') || '');
+                        return /call_end/i.test(x.innerText || '')
+                          || /leave call|leave meeting|покинуть видеовстреч|покинуть вызов|покинуть звон|выйти из вызова|выйти из звон/i.test(t);
+                      });
+                      if (b) b.click();
+                    }"""
                 )
             except Exception:
                 pass
 
             context.close()
-            browser.close()
+            if browser is not None:
+                browser.close()
             # v2: teardown PCM pump, speaker thread, and audio bridge.
             if rt.get("pcm_pump"):
                 try:
@@ -726,6 +1151,34 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
                     rt["bridge"].teardown()
                 except Exception:
                     pass
+            # End-of-meeting summary signal. Only for graceful ends where the
+            # bot actually attended (alone / duration / host-left / explicit
+            # leave / page closed) — never for denied or lobby_timeout, which
+            # request_summary() also guards by joined_at/transcript_lines.
+            GRACEFUL_END = {"alone", "duration_expired", "meet_leave", "page_closed", None}
+            if state.leave_reason in GRACEFUL_END:
+                try:
+                    marker = state.request_summary()
+                except Exception:
+                    marker = None
+                # Optional auto-trigger: a hook command (e.g. a wrapper that
+                # invokes the Hermes agent / codex to run meet-post-call-summary)
+                # gets the meeting dir as its single argument. Detached so bot
+                # teardown isn't blocked on summarization.
+                summary_cmd = os.environ.get("HERMES_MEET_SUMMARY_CMD", "").strip()
+                if marker is not None and summary_cmd:
+                    try:
+                        import shlex
+                        import subprocess
+                        subprocess.Popen(
+                            shlex.split(summary_cmd) + [str(state.out_dir)],
+                            stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            start_new_session=True,
+                        )
+                    except Exception:
+                        pass
             state.set(in_call=False, captioning=False, exited=True)
             return 0
 
@@ -734,15 +1187,80 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
         return 1
 
 
-def _try_guest_name(page, guest_name: str) -> None:
-    """If Meet is showing a guest-name input, type *guest_name* into it."""
+def _try_guest_name(page, guest_name: str) -> bool:
+    """If Meet is showing a guest-name field, type *guest_name* into it.
+
+    Returns True if a field was found and filled. Meet renders the name input
+    a beat *after* the "Got it" dialog is dismissed, so when we detect the
+    guest flow we poll for the field (up to ~10s) instead of giving up on the
+    first miss — that first-miss was why "Ask to join" stayed disabled and the
+    join silently failed. After filling we dispatch an ``input`` event so
+    Meet's React listener re-enables the join button. The authed path ("Join
+    now", no name field) skips the poll entirely and pays no latency.
+    """
+    guest_flow = False
     try:
-        # Meet's guest name input has placeholder "Your name".
-        locator = page.locator('input[aria-label*="name" i]').first
-        if locator.count() and locator.is_visible():
-            locator.fill(guest_name, timeout=2_000)
+        # Bilingual: EN "Got it" / RU "Понятно". The old EN-only exact match
+        # meant a RU dialog never set guest_flow, skipping the name-field poll.
+        got_it = page.get_by_role(
+            "button", name=re.compile(r"^(got it|понятно)$", re.I)
+        ).first
+        if got_it.count() and got_it.is_visible():
+            got_it.click(timeout=2_000)
+            page.wait_for_timeout(500)
+            guest_flow = True
     except Exception:
         pass
+
+    selectors = (
+        'input[aria-label*="name" i]',
+        'input[placeholder*="name" i]',
+        'textarea[aria-label*="name" i]',
+        'textarea[placeholder*="name" i]',
+        '[role="textbox"][aria-label*="name" i]',
+        '[contenteditable="true"][aria-label*="name" i]',
+    )
+
+    def _fill_first() -> bool:
+        for selector in selectors:
+            try:
+                locator = page.locator(selector).first
+                if locator.count() and locator.is_visible():
+                    locator.fill(guest_name, timeout=2_000)
+                    # Nudge Meet's listener so "Ask to join" un-disables.
+                    try:
+                        locator.evaluate(
+                            "(el) => el.dispatchEvent("
+                            "new Event('input', {bubbles: true}))"
+                        )
+                    except Exception:
+                        pass
+                    return True
+            except Exception:
+                continue
+        return False
+
+    if _fill_first():
+        return True
+
+    if guest_flow:
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            try:
+                page.wait_for_timeout(500)
+            except Exception:
+                break
+            if _fill_first():
+                return True
+
+    try:
+        textbox = page.get_by_role("textbox").first
+        if textbox.count() and textbox.is_visible():
+            textbox.fill(guest_name, timeout=2_000)
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def _detect_admission(page) -> bool:
@@ -760,17 +1278,73 @@ def _detect_admission(page) -> bool:
     """
     probe = r"""
     (() => {
-      const leave = document.querySelector('button[aria-label*="eave call" i]');
+      const buttons = Array.from(document.querySelectorAll('button'));
+      // 0) LOBBY GUARD (must run first): the lobby's hangup button has the SAME
+      // aria "Leave call" + 'call_end' ligature as the in-call one, so the leave
+      // button cannot distinguish lobby from call. The lobby is identified by
+      // its "waiting for host" copy instead — if present, we are NOT admitted.
+      const body = document.body ? (document.body.innerText || '') : '';
+      if (/please wait until|asking to be let in|wait(ing)? for the host|you'?ll join the call when|подождите,? пока|вас впуст|ожидайте|организатор.*впуст|запрос на присоединение отправлен/i.test(body)) {
+        return false;
+      }
+      // 1) In-call leave button by RU/EN aria text.
+      const leave = buttons.find((b) => {
+        const text = `${b.innerText || ''} ${b.getAttribute('aria-label') || ''}`;
+        return /leave call|leave meeting|покинуть видеовстреч|покинуть вызов|покинуть звон|выйти из вызова|выйти из звон/i.test(text);
+      });
       if (leave) return true;
+      // 2) Caption region appeared — RU/EN aria (Captions/Субтитры) + current jsname.
       if (window.__hermesMeetInstalled) {
         const caps = document.querySelector(
           '[role="region"][aria-label*="aption" i], ' +
-          'div[jsname="YSxPC"], div[jsname="tgaKEf"]'
+          '[role="region"][aria-label*="убтитр" i], ' +
+          'div[jsname="dsyhDe"]'
         );
         if (caps) return true;
       }
-      const parts = document.querySelector('[aria-label*="articipants" i]');
+      // 3) Participants container — RU/EN aria or people/group ligature button.
+      const parts = document.querySelector(
+        '[aria-label*="articipants" i], [aria-label*="участник" i]'
+      );
       if (parts) return true;
+      const partBtn = buttons.some((b) => /^(people|group)$/i.test((b.innerText || '').trim()));
+      if (partBtn) return true;
+      return false;
+    })();
+    """
+    try:
+        return bool(page.evaluate(probe))
+    except Exception:
+        return False
+
+
+def _detect_alone(page) -> bool:
+    """True when the bot is the ONLY participant left (everyone else has gone).
+
+    Used to auto-end the meeting (and trigger summarization) once the humans
+    leave. Two signals: Meet's "no one else" copy (RU+EN), and a participant
+    count of 1 parsed from the people button / call header. Conservative:
+    returns False on any error or ambiguity (better to linger than leave early).
+    """
+    probe = r"""
+    (() => {
+      const body = document.body ? (document.body.innerText || '') : '';
+      // 1) Explicit "you're alone" copy.
+      if (/no one else is here|you'?re the only one|everyone else (has )?left|waiting for others to join/i.test(body)) return true;
+      if (/кроме вас,? здесь больше никого|вы единственный участник|все остальные вышли|больше никого нет/i.test(body)) return true;
+      // 2) Participant count == 1 (people button / aria like "Participants, 1"
+      //    or RU "Участники, 1"). Only trust an explicit numeric count.
+      const els = [...document.querySelectorAll('button,[role="button"],[aria-label]')];
+      for (const e of els) {
+        const a = e.getAttribute('aria-label') || '';
+        const m = a.match(/(participants|people|участник[аи]?)\D{0,4}(\d+)/i)
+               || a.match(/(\d+)\D{0,4}(participants|people|участник)/i);
+        if (m) {
+          const n = parseInt(m[2] && /\d/.test(m[2]) ? m[2] : m[1], 10);
+          if (n === 1) return true;
+          if (n >= 2) return false;
+        }
+      }
       return false;
     })();
     """
@@ -781,15 +1355,29 @@ def _detect_admission(page) -> bool:
 
 
 def _detect_denied(page) -> bool:
-    """True when Meet is showing a 'you were denied' / 'no one admitted' page."""
+    """True when Meet is showing a 'you were denied' / 'no one admitted' page.
+
+    Matches both EN and RU wordings (loose stems to survive declension). Without
+    the RU variants a denied/removed RU-locale bot was misclassified as a lobby
+    timeout — wrong leave_reason and a full HERMES_MEET_LOBBY_TIMEOUT wait.
+    """
     probe = r"""
     (() => {
       const text = document.body ? document.body.innerText || '' : '';
-      // English only — matches what shows up when the host denies or
-      // removes a guest.
+      // Host denied the join request. The live wording is "Someone in the call
+      // denied your request to join" (captured), plus older variants.
+      if (/denied your request to join/i.test(text)) return true;
+      if (/отклонил[аи]? ваш запрос|отклонил[аи]? запрос на присоединение|ваш запрос (на присоединение )?отклон/i.test(text)) return true;
+      // Denied / can't join.
       if (/You can't join this video call/i.test(text)) return true;
+      if (/не можете присоединиться к (этой |этому )?(видео)?(встрече|звонку|конференции)/i.test(text)) return true;
+      if (/вам отказано в доступе|в доступе отказано/i.test(text)) return true;
+      // Removed from the meeting.
       if (/You were removed from the meeting/i.test(text)) return true;
+      if (/вас удалил[аи]? (из|со) (встречи|видеовстречи|звонка|конференции)/i.test(text)) return true;
+      // No one responded to the join request.
       if (/No one responded to your request to join/i.test(text)) return true;
+      if (/никто не ответил на ваш запрос/i.test(text)) return true;
       return false;
     })();
     """
@@ -797,6 +1385,52 @@ def _detect_denied(page) -> bool:
         return bool(page.evaluate(probe))
     except Exception:
         return False
+
+
+def _auth_gate(page):
+    """Verify the browser is signed in to Google before joining a meeting.
+
+    Navigates to the account page and decides by the *landing URL* (robust)
+    plus Google's "this browser may not be secure" automation-block text.
+    URL is used instead of body-text scraping because a genuinely signed-in
+    ``myaccount`` page contains settings labels like "Sign-in & security" that
+    would false-positive a naive "sign in" text match. When signed out, Google
+    redirects ``myaccount.google.com`` to an ``accounts.google.com`` sign-in
+    flow. Returns ``(authed: bool, reason: str)``; conservative on any error.
+    """
+    try:
+        page.goto(
+            "https://myaccount.google.com/",
+            wait_until="domcontentloaded",
+            timeout=30_000,
+        )
+    except Exception as e:
+        return (False, f"account page navigation failed: {e}")
+    try:
+        url_now = (page.url or "").lower()
+    except Exception:
+        url_now = ""
+    try:
+        text = (
+            page.evaluate("() => (document.body ? document.body.innerText || '' : '')")
+            or ""
+        ).lower()
+    except Exception:
+        text = ""
+    if "may not be secure" in text:
+        return (False, "google blocked this browser as insecure (automation detected)")
+    if "accounts.google.com" in url_now and (
+        "signin" in url_now or "servicelogin" in url_now
+    ):
+        return (False, f"redirected to sign-in ({url_now})")
+    # Signed-out users hitting myaccount are bounced to the public marketing
+    # page google.com/account/about — a reliable "not signed in" signal even
+    # when stale cookies remain in the jar (Google invalidates server-side).
+    if "/account/about" in url_now:
+        return (False, "not signed in (bounced to account/about page)")
+    if "myaccount.google.com" in url_now:
+        return (True, "signed in")
+    return (False, f"could not confirm signed-in state (url={url_now or 'unknown'})")
 
 
 def _looks_like_human_speaker(speaker: str, bot_guest_name: str) -> bool:
@@ -819,22 +1453,117 @@ def _looks_like_human_speaker(speaker: str, bot_guest_name: str) -> bool:
     return True
 
 
-def _click_join(page, state: _BotState) -> None:
-    """Click 'Join now' or 'Ask to join' if either button is visible.
+def _click_join(page, state: _BotState) -> bool:
+    """Click the Meet join/request button if it is visible.
+
+    Meet localizes the pre-join UI, and in headless mode Playwright's
+    accessible role locator can miss a visible DOM button such as Russian
+    ``Присоединиться``. Try role-based labels first, then fall back to a
+    direct DOM button scan by innerText/aria-label. The button can appear a
+    few seconds after DOMContentLoaded, so this helper waits briefly while
+    keeping the original run_bot call-site unchanged.
 
     Flags ``lobby_waiting`` when we hit the "waiting for host to admit you"
     state so the agent can surface that in status.
     """
-    for label in ("Join now", "Ask to join"):
+    # Pre-join buttons, bilingual (RU+EN). Order matters: match the
+    # ask-to-join (host-admission) variant BEFORE the plain join, because in RU
+    # the affirmative button's visible text is also "Присоединиться" and only
+    # its aria-label ("Отправить запрос…") marks the lobby flow.
+    candidates = (
+        (re.compile(r"ask to join|отправить запрос|запросить подключение", re.I), True),
+        (re.compile(r"\bjoin now\b|^\s*присоединиться\s*$", re.I), False),
+        (re.compile(r"join here|присоединиться здесь", re.I), False),
+    )
+    deadline = time.time() + 20.0
+    while time.time() < deadline:
         try:
-            btn = page.get_by_role("button", name=label, exact=False).first
-            if btn.count() and btn.is_visible():
-                btn.click(timeout=3_000)
-                if label == "Ask to join":
-                    state.set(lobby_waiting=True)
-                break
+            page.evaluate(
+                r"""
+                (realtime) => {
+                  const click = (rx, avoid) => {
+                    const b = Array.from(document.querySelectorAll('button')).find((btn) => {
+                      const text = `${btn.innerText || ''} ${btn.getAttribute('aria-label') || ''}`;
+                      return rx.test(text) && !(avoid && avoid.test(text));
+                    });
+                    if (b) { b.click(); return true; }
+                    return false;
+                  };
+                  // Meet shows a "Do you want people to hear you?" modal before
+                  // join. In TRANSCRIBE mode the bot is receive-only → dismiss it
+                  // via "Continue without microphone" (guarding the affirmative).
+                  // In REALTIME mode the bot SPEAKS → click the affirmative
+                  // "Use microphone" so it joins WITH a mic (else it is silent).
+                  if (realtime) {
+                    click(/use microphone|использовать микрофон/i);
+                  } else {
+                    click(/don't use microphone|do not use microphone|continue without microphone|продолжить без микрофона|не включать микрофон|без микрофона/i,
+                          /use microphone|использовать микрофон/i);
+                  }
+                  // Dismiss onboarding tooltips ("Got it" / "Понятно").
+                  click(/^\s*got it\s*$|^\s*понятно\s*$/i);
+                  return true;
+                }
+                """,
+                mode == "realtime",
+            )
         except Exception:
-            continue
+            pass
+
+        for name_rx, waits_for_lobby in candidates:
+            try:
+                btn = page.get_by_role("button", name=name_rx).first
+                if btn.count() and btn.is_visible():
+                    btn.click(timeout=3_000)
+                    if waits_for_lobby:
+                        state.set(lobby_waiting=True)
+                    return True
+            except Exception:
+                continue
+
+        try:
+            clicked = page.evaluate(
+                r"""
+                () => {
+                  const labels = [
+                    { rx: /ask to join|отправить запрос|запросить подключение/i, avoid: /companion|режиме companion/i, waitsForLobby: true },
+                    { rx: /\bjoin now\b|^присоединиться$/i, avoid: null, waitsForLobby: false },
+                  ];
+                  for (const b of Array.from(document.querySelectorAll('button'))) {
+                    const inner = (b.innerText || '').trim();
+                    const aria = (b.getAttribute('aria-label') || '').trim();
+                    const text = inner + ' ' + aria;
+                    const visible = !!(b.offsetWidth || b.offsetHeight || b.getClientRects().length);
+                    const disabled = b.disabled || b.getAttribute('aria-disabled') === 'true';
+                    if (!visible || disabled) continue;
+                    // "Join here" recovery (account already in call elsewhere):
+                    // anchor on the locale-independent 'add_to_queue' icon
+                    // ligature, and NEVER click "Switch here" (moves someone's call).
+                    if (/(^|[^a-z])add_to_queue/i.test(inner) && !/switch here|переключиться|сменить устройство/i.test(text)) {
+                      b.click();
+                      return { clicked: true, inner, aria, waitsForLobby: false };
+                    }
+                    const match = labels.find((l) => (l.rx.test(inner) || l.rx.test(aria)) && !(l.avoid && l.avoid.test(text)));
+                    if (match) {
+                      b.click();
+                      return { clicked: true, inner, aria, waitsForLobby: match.waitsForLobby };
+                    }
+                  }
+                  return { clicked: false };
+                }
+                """
+            )
+            if isinstance(clicked, dict) and clicked.get("clicked"):
+                if clicked.get("waitsForLobby"):
+                    state.set(lobby_waiting=True)
+                return True
+        except Exception:
+            pass
+        try:
+            page.wait_for_timeout(1000)
+        except Exception:
+            time.sleep(1.0)
+    return False
 
 
 def _parse_duration(raw: str) -> Optional[float]:

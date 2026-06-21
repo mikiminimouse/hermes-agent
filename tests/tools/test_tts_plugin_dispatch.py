@@ -94,7 +94,7 @@ class TestBuiltinAlwaysWins:
     @pytest.mark.parametrize(
         "builtin",
         ["edge", "openai", "elevenlabs", "minimax", "gemini",
-         "mistral", "xai", "piper", "kittentts", "neutts"],
+         "mistral", "xai", "kittentts", "neutts"],
     )
     def test_dispatcher_short_circuits_builtin(self, builtin):
         result = tts_tool._dispatch_to_plugin_provider(
@@ -296,7 +296,7 @@ class TestVoiceCompatibleHelper:
     @pytest.mark.parametrize(
         "builtin",
         ["edge", "openai", "elevenlabs", "minimax", "gemini",
-         "mistral", "xai", "piper", "kittentts", "neutts"],
+         "mistral", "xai", "kittentts", "neutts"],
     )
     def test_builtin_names_return_false(self, builtin):
         """voice_compatible helper short-circuits built-ins so they go

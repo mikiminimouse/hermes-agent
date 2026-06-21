@@ -310,14 +310,6 @@ TOOL_CATEGORIES = {
                 "tts_provider": "kittentts",
                 "post_setup": "kittentts",
             },
-            {
-                "name": "Piper",
-                "badge": "local · free",
-                "tag": "Local neural TTS, 44 languages (voices ~20-90MB)",
-                "env_vars": [],
-                "tts_provider": "piper",
-                "post_setup": "piper",
-            },
         ],
     },
     "web": {
@@ -999,29 +991,6 @@ def _run_post_setup(post_setup_key: str):
             _print_warning("    kittentts install timed out (>5min)")
             _print_info(f"    Run manually: uv pip install -U '{wheel_url}' soundfile")
 
-    elif post_setup_key == "piper":
-        try:
-            __import__("piper")
-            _print_success("    piper-tts is already installed")
-        except ImportError:
-            _print_info("    Installing piper-tts (~14MB wheel, voices downloaded on first use)...")
-            try:
-                result = _pip_install(["-U", "piper-tts", "--quiet"], timeout=300)
-                if result.returncode == 0:
-                    _print_success("    piper-tts installed")
-                else:
-                    _print_warning("    piper-tts install failed:")
-                    _print_info(f"      {(result.stderr or '').strip()[:300]}")
-                    _print_info("    Run manually: uv pip install -U piper-tts")
-                    return
-            except subprocess.TimeoutExpired:
-                _print_warning("    piper-tts install timed out (>5min)")
-                _print_info("    Run manually: uv pip install -U piper-tts")
-                return
-        _print_info("    Default voice: en_US-lessac-medium (downloaded on first TTS call)")
-        _print_info("    Full voice list: https://github.com/OHF-Voice/piper1-gpl/blob/main/docs/VOICES.md")
-        _print_info("    Switch voices by setting tts.piper.voice in ~/.hermes/config.yaml")
-
     elif post_setup_key == "ddgs":
         try:
             __import__("ddgs")
@@ -1207,7 +1176,7 @@ def run_post_setup_command(args) -> int:
     """``hermes tools post-setup <key>`` — non-interactive post-setup runner.
 
     Runs the install/bootstrap hook a provider declares (npm install for
-    browser/Camofox, pip install for kittentts/piper/ddgs, cua-driver fetch,
+    browser/Camofox, pip install for kittentts/ddgs, cua-driver fetch,
     etc.). This is the stable, scriptable target the dashboard spawns so the
     GUI can drive backend setup without re-implementing the install logic.
     Returns a process exit code (0 ok, 2 unknown key).
@@ -2136,7 +2105,7 @@ _POST_SETUP_INSTALLED: dict = {
     # provider-setup flow that would have run the post_setup hook).
     #
     # Only entries here are gated; other post_setup hooks (kittentts,
-    # piper, agent_browser, etc.) keep their existing behaviour. Add an
+    # agent_browser, etc.) keep their existing behaviour. Add an
     # entry when (a) the post_setup is the ONLY install side-effect for
     # a no-key provider, and (b) an installed-state check is cheap and
     # doesn't trigger a heavy import.

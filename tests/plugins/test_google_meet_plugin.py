@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 from pathlib import Path
 from unittest.mock import patch
@@ -112,6 +113,75 @@ def test_bot_state_ignores_blank_text(tmp_path):
     assert status["transcriptLines"] == 1
     # blank-speaker falls back to "Unknown"
     assert "Unknown: text but no speaker" in (tmp_path / "s" / "transcript.txt").read_text()
+
+
+def test_request_summary_writes_marker_when_attended(tmp_path):
+    from plugins.google_meet.meet_bot import _BotState
+
+    out = tmp_path / "session"
+    state = _BotState(out_dir=out, meeting_id="abc-defg-hij",
+                      url="https://meet.google.com/abc-defg-hij")
+    # Simulate an attended meeting with content.
+    state.set(joined_at=1.0, leave_reason="alone")
+    state.record_caption("Alice", "Discussed the roadmap")
+
+    marker = state.request_summary()
+    assert marker is not None and marker.exists()
+    data = json.loads(marker.read_text())
+    assert data["status"] == "pending"
+    assert data["leaveReason"] == "alone"
+    assert data["transcriptLines"] == 1
+    assert data["reportPath"].endswith("report.md")
+
+
+def test_request_summary_skips_when_never_joined_or_empty(tmp_path):
+    from plugins.google_meet.meet_bot import _BotState
+
+    # Never joined (denied/lobby_timeout): no marker.
+    s1 = _BotState(out_dir=tmp_path / "a", meeting_id="x-y-z",
+                   url="https://meet.google.com/x-y-z")
+    s1.set(leave_reason="denied")
+    assert s1.request_summary() is None
+    assert not (tmp_path / "a" / "summary_request.json").exists()
+
+    # Joined but no captions captured: nothing to summarize.
+    s2 = _BotState(out_dir=tmp_path / "b", meeting_id="x-y-z",
+                   url="https://meet.google.com/x-y-z")
+    s2.set(joined_at=1.0, leave_reason="duration_expired")
+    assert s2.request_summary() is None
+
+
+def test_collapse_transcript_reconstructs_dialogue_from_rolling_captions():
+    from plugins.google_meet.meet_summarize import collapse_transcript
+
+    # Meet captions: each line is a growing snapshot of the caption region with
+    # speaker names embedded INLINE, re-scraped per mutation (prefix growth +
+    # ASR punctuation revision), then the window scrolls.
+    raw = "\n".join([
+        "[10:00:01] Виталий Бычков: Привет",
+        "[10:00:02] Виталий Бычков: Привет давай",
+        "[10:00:02] Виталий Бычков: Привет давай начнём.",
+        "[10:00:05] Виталий Бычков: Привет давай начнём. You Привет",
+        "[10:00:06] Виталий Бычков: Привет давай начнём. You Привет готов",
+        "[10:00:07] Виталий Бычков: Привет давай начнём. You Привет, готов работать.",
+    ])
+    out = collapse_transcript(raw)
+    lines = out.splitlines()
+    # Two final utterances, one per speaker turn, bot relabeled, prefixes gone.
+    assert len(lines) == 2
+    assert "Виталий Бычков:" in lines[0]
+    assert "Привет давай начнём." in lines[0]
+    assert "Verter (бот):" in lines[1]
+    assert "готов работать" in lines[1]
+    # No surviving partial-prefix rows.
+    assert "Привет давай\n" not in out
+
+
+def test_collapse_transcript_empty_and_noise():
+    from plugins.google_meet.meet_summarize import collapse_transcript
+
+    assert collapse_transcript("") == ""
+    assert collapse_transcript("garbage line with no timestamp") == ""
 
 
 def test_parse_duration():
@@ -675,6 +745,166 @@ def test_detect_admission_true_when_probe_returns_true():
     assert _detect_admission(_FakePage()) is True
 
 
+def test_try_guest_name_uses_fallback_textbox_role():
+    from plugins.google_meet.meet_bot import _try_guest_name
+
+    class _EmptyLocator:
+        first = None
+
+        def __init__(self):
+            self.first = self
+
+        def count(self):
+            return 0
+
+        def is_visible(self):
+            return False
+
+    class _Textbox:
+        def __init__(self):
+            self.filled = None
+            self.first = self
+
+        def count(self):
+            return 1
+
+        def is_visible(self):
+            return True
+
+        def fill(self, value, timeout=None):
+            self.filled = value
+
+    class _FakePage:
+        def __init__(self):
+            self.textbox = _Textbox()
+
+        def locator(self, _selector):
+            return _EmptyLocator()
+
+        def get_by_role(self, role):
+            assert role == "textbox"
+            return self.textbox
+
+    page = _FakePage()
+    _try_guest_name(page, "Verter")
+    assert page.textbox.filled == "Verter"
+
+
+def test_click_join_supports_russian_role_label(tmp_path):
+    from plugins.google_meet.meet_bot import _BotState, _click_join
+
+    class _FakeButton:
+        def __init__(self, visible):
+            self.visible = visible
+            self.clicked = False
+
+        def count(self):
+            return 1
+
+        def is_visible(self):
+            return self.visible
+
+        def inner_text(self, timeout=None):
+            return "Присоединиться"
+
+        def get_attribute(self, name, timeout=None):
+            return None
+
+        def click(self, timeout=None):
+            self.clicked = True
+
+    class _FakeLocator:
+        def __init__(self, button):
+            self.first = button
+
+    class _FakePage:
+        def __init__(self):
+            self.ru_button = _FakeButton(True)
+
+        def get_by_role(self, role, name=None, exact=False):
+            # name is now a compiled regex (bilingual matcher). Return the RU
+            # button when the pattern matches the Russian join label.
+            pat = name if hasattr(name, "search") else re.compile(re.escape(str(name)), re.I)
+            if pat.search("Присоединиться"):
+                return _FakeLocator(self.ru_button)
+            return _FakeLocator(_FakeButton(False))
+
+    page = _FakePage()
+    state = _BotState(out_dir=tmp_path / "s", meeting_id="abc-defg-hij",
+                      url="https://meet.google.com/abc-defg-hij")
+    assert _click_join(page, state) is True
+    assert page.ru_button.clicked is True
+
+
+def test_click_join_uses_dom_fallback_when_role_locator_misses(tmp_path):
+    from plugins.google_meet.meet_bot import _BotState, _click_join
+
+    class _FakeButton:
+        def count(self):
+            return 0
+
+        def is_visible(self):
+            return False
+
+    class _FakeLocator:
+        first = _FakeButton()
+
+    class _FakePage:
+        def __init__(self):
+            self.dom_clicked = False
+
+        def get_by_role(self, role, name=None, exact=False):
+            return _FakeLocator()
+
+        def evaluate(self, js):
+            # The DOM fallback scan is bilingual (case-insensitive regexes).
+            assert "присоединиться" in js.lower()
+            self.dom_clicked = True
+            return {
+                "clicked": True,
+                "inner": "Присоединиться",
+                "aria": "Отправить запрос на подключение без использования камеры",
+                "waitsForLobby": False,
+            }
+
+    page = _FakePage()
+    state = _BotState(out_dir=tmp_path / "s", meeting_id="abc-defg-hij",
+                      url="https://meet.google.com/abc-defg-hij")
+    assert _click_join(page, state) is True
+    assert page.dom_clicked is True
+    assert state.lobby_waiting is False
+
+
+def test_click_join_does_not_include_speculative_labels():
+    import inspect
+    from plugins.google_meet.meet_bot import _click_join
+
+    source = inspect.getsource(_click_join)
+    # Real, confirmed RU+EN labels (case-insensitive matchers) + the
+    # locale-independent 'add_to_queue' ligature anchor for "Join here".
+    assert "join now" in source.lower()
+    assert "ask to join" in source
+    assert "присоединиться" in source.lower()
+    assert "отправить запрос" in source.lower()
+    assert "add_to_queue" in source
+    # No speculative/unverified labels.
+    for label in (
+        "Tham gia ngay",
+        "Yêu cầu tham gia",
+        "Запросить доступ",
+    ):
+        assert label not in source
+
+
+def test_run_bot_does_not_exit_early_when_join_button_is_missing():
+    import inspect
+    from plugins.google_meet.meet_bot import run_bot
+
+    source = inspect.getsource(run_bot)
+    assert 'state.set(error="join button not clicked", exited=True)' not in source
+    assert 'return 5' not in source
+
+
 def test_detect_denied_returns_false_on_error():
     from plugins.google_meet.meet_bot import _detect_denied
 
@@ -811,3 +1041,181 @@ def test_cmd_install_realtime_skips_when_deps_present(capsys):
     assert sudo_calls == [], f"unexpected sudo invocation: {sudo_calls}"
     out = capsys.readouterr().out
     assert "already installed" in out
+
+
+def test_auth_gate_signed_in():
+    """myaccount stays on myaccount.google.com => authed."""
+    from plugins.google_meet.meet_bot import _auth_gate
+
+    class _Page:
+        url = "https://myaccount.google.com/"
+
+        def goto(self, *a, **k):
+            pass
+
+        def evaluate(self, _js):
+            return "Welcome, Verter — Manage your Google Account"
+
+    authed, _reason = _auth_gate(_Page())
+    assert authed is True
+
+
+def test_auth_gate_signed_out_redirect():
+    """Redirect to accounts.google.com/.../signin => not authed."""
+    from plugins.google_meet.meet_bot import _auth_gate
+
+    class _Page:
+        url = "https://accounts.google.com/v3/signin/identifier?continue=x"
+
+        def goto(self, *a, **k):
+            pass
+
+        def evaluate(self, _js):
+            return "Sign in"
+
+    authed, reason = _auth_gate(_Page())
+    assert authed is False
+    assert "sign-in" in reason
+
+
+def test_auth_gate_insecure_block():
+    """Google's automation block text => not authed, regardless of URL."""
+    from plugins.google_meet.meet_bot import _auth_gate
+
+    class _Page:
+        url = "https://accounts.google.com/signin/v2/challenge"
+
+        def goto(self, *a, **k):
+            pass
+
+        def evaluate(self, _js):
+            return "This browser or app may not be secure."
+
+    authed, reason = _auth_gate(_Page())
+    assert authed is False
+    assert "insecure" in reason
+
+
+def test_try_guest_name_fills_and_dispatches_input():
+    """Selector match => fill, dispatch input event, return True."""
+    from plugins.google_meet.meet_bot import _try_guest_name
+
+    class _Loc:
+        def __init__(self):
+            self.first = self
+            self.filled = None
+            self.dispatched = False
+
+        def count(self):
+            return 1
+
+        def is_visible(self):
+            return True
+
+        def fill(self, value, timeout=None):
+            self.filled = value
+
+        def evaluate(self, _js):
+            self.dispatched = True
+
+    class _NoGotIt:
+        def __init__(self):
+            self.first = self
+
+        def count(self):
+            return 0
+
+        def is_visible(self):
+            return False
+
+    class _Page:
+        def __init__(self):
+            self.loc = _Loc()
+
+        def get_by_role(self, role, **kw):
+            return _NoGotIt()
+
+        def locator(self, _selector):
+            return self.loc
+
+    page = _Page()
+    ok = _try_guest_name(page, "Verter")
+    assert ok is True
+    assert page.loc.filled == "Verter"
+    assert page.loc.dispatched is True
+
+
+def test_auth_gate_signed_out_about_page():
+    """Signed-out users get bounced to google.com/account/about => not authed."""
+    from plugins.google_meet.meet_bot import _auth_gate
+
+    class _Page:
+        url = "https://www.google.com/account/about/?hl=en-US"
+
+        def goto(self, *a, **k):
+            pass
+
+        def evaluate(self, _js):
+            return "Sign in to your Google Account"
+
+    authed, reason = _auth_gate(_Page())
+    assert authed is False
+    assert "about" in reason
+
+
+def test_enable_captions_uses_locale_independent_ligature():
+    import inspect
+    from plugins.google_meet.meet_bot import _enable_captions_js
+
+    src = _enable_captions_js()
+    # Locale-independent material-icon ligature is the primary anchor.
+    assert "closed_caption_off" in src
+    # Plus bilingual text fallbacks.
+    assert "turn on captions" in src.lower()
+    assert "включить субтитры" in src.lower()
+
+
+def test_detect_denied_is_bilingual():
+    import inspect
+    from plugins.google_meet.meet_bot import _detect_denied
+
+    src = inspect.getsource(_detect_denied)
+    assert "You can't join this video call" in src
+    assert "denied your request to join" in src  # live host-denial wording
+    # Russian denial/removal wordings so RU denials aren't misread as timeouts.
+    assert "не можете присоединиться" in src.lower()
+    assert "удалил" in src.lower()
+
+
+def test_set_caption_language_escapes_and_forces_russian():
+    import inspect
+    from plugins.google_meet.meet_bot import _set_caption_language
+
+    src = inspect.getsource(_set_caption_language)
+    assert "re.escape" in src           # operator value not compiled raw
+    assert "russian" in src.lower()
+    assert "русск" in src.lower()        # matches RU-UI option label too
+
+
+def test_detect_admission_drops_dead_jsname_and_adds_ru():
+    import inspect
+    from plugins.google_meet.meet_bot import _detect_admission
+
+    src = inspect.getsource(_detect_admission)
+    assert "call_end" in src             # locale-independent hangup ligature
+    assert "убтитр" in src               # RU caption region aria stem
+    assert 'jsname="YSxPC"' not in src   # dead legacy selector removed
+
+
+def test_detect_admission_has_lobby_guard():
+    import inspect
+    from plugins.google_meet.meet_bot import _detect_admission
+
+    src = inspect.getsource(_detect_admission)
+    # Lobby is identified by its "waiting for host" copy because the lobby
+    # hangup button shares aria "Leave call" with the in-call one.
+    assert "please wait until" in src.lower()
+    assert "asking to be let in" in src.lower()
+    assert "впуст" in src  # RU lobby copy stem
+
+

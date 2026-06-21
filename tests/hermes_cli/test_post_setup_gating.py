@@ -57,7 +57,7 @@ class TestPostSetupGate:
     def test_unregistered_post_setup_treated_as_satisfied(self):
         """post_setup keys without a registered predicate must default to
         'satisfied' so we don't change behaviour for hooks we haven't
-        explicitly opted in (kittentts, piper, agent_browser, etc.)."""
+        explicitly opted in (kittentts, agent_browser, etc.)."""
         from hermes_cli import tools_config
 
         assert tools_config._post_setup_already_installed("does_not_exist") is True
