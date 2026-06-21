@@ -77,6 +77,16 @@ class AudioBridge:
         """Release the virtual audio device. Idempotent."""
         if self._torn_down:
             return
+        # Restore the previous default source (best-effort) before unloading,
+        # so we don't leave the host pointed at a soon-to-vanish virtual mic.
+        if self._platform == "linux" and getattr(self, "_old_default_source", None):
+            try:
+                subprocess.run(
+                    ["pactl", "set-default-source", self._old_default_source],
+                    check=False, capture_output=True, stdin=subprocess.DEVNULL,
+                )
+            except Exception:
+                pass
         # Only Linux needs explicit unloading.
         if self._platform == "linux" and self._module_ids:
             # Unload in reverse order (virtual-source before null-sink).
@@ -157,6 +167,28 @@ class AudioBridge:
             ) from exc
 
         src_mod_id = self._parse_module_id(src_out.stdout)
+
+        # Make our remapped source the system DEFAULT source. PULSE_SOURCE alone
+        # is unreliable — Chrome/Meet's getUserMedia resolves "default" through
+        # PulseAudio's default source, and Meet may pick a remembered/enumerated
+        # device over PULSE_SOURCE. Setting the default forces capture onto our
+        # virtual mic. Saved + restored on teardown so we don't hijack the host.
+        self._old_default_source = None
+        try:
+            info = subprocess.run(
+                ["pactl", "get-default-source"],
+                check=False, capture_output=True, text=True, stdin=subprocess.DEVNULL,
+            )
+            self._old_default_source = (info.stdout or "").strip() or None
+        except Exception:
+            self._old_default_source = None
+        try:
+            subprocess.run(
+                ["pactl", "set-default-source", src_name],
+                check=False, capture_output=True, text=True, stdin=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
 
         self._platform = "linux"
         self._device_name = src_name

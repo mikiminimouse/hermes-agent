@@ -795,6 +795,35 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
                     state.set(error=f"auth gate failed: {reason}", exited=True)
                     return 4
 
+            # Realtime: force mic capture constraints before Meet's JS runs, so
+            # Chrome/Meet don't apply echo-cancellation / noise-suppression /
+            # auto-gain that suppress our steady loopback (virtual-mic) audio as
+            # "noise". Best-effort: Chrome may keep some processing, but this
+            # removes the constraint-driven suppression of synthetic speech.
+            if os.environ.get("HERMES_MEET_MODE", "").strip().lower() == "realtime":
+                try:
+                    page.add_init_script(
+                        """(() => {
+                          const md = navigator.mediaDevices;
+                          if (!md || !md.getUserMedia) return;
+                          const orig = md.getUserMedia.bind(md);
+                          md.getUserMedia = (c) => {
+                            c = c || {};
+                            if (c.audio) {
+                              const a = (typeof c.audio === 'object') ? c.audio : {};
+                              c.audio = Object.assign({}, a, {
+                                echoCancellation: false,
+                                noiseSuppression: false,
+                                autoGainControl: false,
+                              });
+                            }
+                            return orig(c);
+                          };
+                        })();"""
+                    )
+                except Exception:
+                    pass
+
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=30_000)
             except Exception as e:
@@ -879,11 +908,28 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
             caption_lang_done = False
             last_lang_try = 0.0
             lang_attempts = 0
+            mic_unmute_attempts = 0
             while not stop_flag["stop"]:
                 now = time.time()
                 if deadline and now > deadline:
                     state.set(leave_reason="duration_expired")
                     break
+
+                # Realtime: once in-call, make sure the mic is UNMUTED — Meet can
+                # join muted, and a muted track means no one hears the TTS even
+                # though audio flows into the fake-mic. Idempotent: once unmuted
+                # the button reads "Turn off microphone" and no longer matches.
+                if rt["enabled"] and state.in_call and mic_unmute_attempts < 6:
+                    mic_unmute_attempts += 1
+                    try:
+                        page.evaluate(
+                            r"""()=>{const b=[...document.querySelectorAll('button')].find(x=>{
+                              const s=(x.innerText||'')+' '+(x.getAttribute('aria-label')||'');
+                              return /turn on microphone|включить микрофон/i.test(s);});
+                              if(b)b.click();}"""
+                        )
+                    except Exception:
+                        pass
 
                 # Admission detection every ~3s until admitted.
                 if not state.in_call and (now - last_admission_check) > 3.0:
@@ -1304,7 +1350,7 @@ def _click_join(page, state: _BotState) -> bool:
         try:
             page.evaluate(
                 r"""
-                () => {
+                (realtime) => {
                   const click = (rx, avoid) => {
                     const b = Array.from(document.querySelectorAll('button')).find((btn) => {
                       const text = `${btn.innerText || ''} ${btn.getAttribute('aria-label') || ''}`;
@@ -1313,17 +1359,23 @@ def _click_join(page, state: _BotState) -> bool:
                     if (b) { b.click(); return true; }
                     return false;
                   };
-                  // Receive-only (transcribe) mode has no microphone, so Meet
-                  // shows a "Do you want people to hear you?" modal overlaying the
-                  // join button. Dismiss it (RU+EN) but NEVER the affirmative
-                  // "Use microphone" / "Использовать микрофон" (explicit guard).
-                  click(/don't use microphone|do not use microphone|continue without microphone|продолжить без микрофона|не включать микрофон|без микрофона/i,
-                        /use microphone|использовать микрофон/i);
+                  // Meet shows a "Do you want people to hear you?" modal before
+                  // join. In TRANSCRIBE mode the bot is receive-only → dismiss it
+                  // via "Continue without microphone" (guarding the affirmative).
+                  // In REALTIME mode the bot SPEAKS → click the affirmative
+                  // "Use microphone" so it joins WITH a mic (else it is silent).
+                  if (realtime) {
+                    click(/use microphone|использовать микрофон/i);
+                  } else {
+                    click(/don't use microphone|do not use microphone|continue without microphone|продолжить без микрофона|не включать микрофон|без микрофона/i,
+                          /use microphone|использовать микрофон/i);
+                  }
                   // Dismiss onboarding tooltips ("Got it" / "Понятно").
                   click(/^\s*got it\s*$|^\s*понятно\s*$/i);
                   return true;
                 }
-                """
+                """,
+                os.environ.get("HERMES_MEET_MODE", "").strip().lower() == "realtime",
             )
         except Exception:
             pass
