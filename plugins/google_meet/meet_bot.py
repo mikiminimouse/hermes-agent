@@ -296,24 +296,34 @@ def _set_caption_language(page, lang: str) -> bool:
         except Exception:
             pass
 
-    # Open caption settings: localized text first, then the gear ligature.
-    try:
-        page.evaluate(
-            r"""()=>{
-              const bs=[...document.querySelectorAll('button,[role="button"]')];
-              const t=bs.find(x=>/open caption settings|caption settings|(настройки|параметры) субтитров/i
-                .test((x.innerText||'')+' '+(x.getAttribute('aria-label')||'')));
-              if(t){t.click();return;}
-              const g=bs.find(x=>(x.innerText||'').trim()==='settings'
-                || /^(settings|настройки)$/i.test(x.getAttribute('aria-label')||''));
-              if(g)g.click();
-            }"""
-        )
-    except Exception as e:
-        _log(f"settings button failed: {e}")
+    # The language picker lives ONLY in the caption-settings dialog reached via
+    # the caption overlay's "Open caption settings" button — that entry opens
+    # Settings directly on the Captions section with the "Language of the
+    # meeting" combobox. The generic ⋮ → Settings dialog has NO Captions tab, so
+    # it is a dead end. The button appears a beat after captions are enabled, so
+    # retry briefly (RU/EN text).
+    opened_settings = False
+    for _ in range(6):
+        try:
+            opened_settings = bool(page.evaluate(
+                r"""()=>{const bs=[...document.querySelectorAll('button,[role="button"]')];
+                  const t=bs.find(x=>/open caption settings|(настройки|параметры) субтитров/i
+                    .test((x.innerText||'')+' '+(x.getAttribute('aria-label')||'')));
+                  if(t){t.click();return true;} return false;}"""
+            ))
+        except Exception:
+            opened_settings = False
+        if opened_settings:
+            break
+        try:
+            page.wait_for_timeout(1000)
+        except Exception:
+            pass
+    if not opened_settings:
+        _log("'open caption settings' not available (captions overlay not up yet)")
         return False
     try:
-        page.wait_for_timeout(1500)
+        page.wait_for_timeout(1200)
     except Exception:
         pass
 
@@ -322,22 +332,31 @@ def _set_caption_language(page, lang: str) -> bool:
     ru_pat = r"^\s*(russian|русск" + (("|" + safe) if safe else "") + r")"
     rx_ru = re.compile(ru_pat, re.I)
 
-    # Open the language combobox (role anchor; prefer language/язык-named one).
+    # Open the language combobox (role anchor; prefer a language/язык-named one).
+    # The dialog renders asynchronously, so poll a few times (count() is instant)
+    # before giving up rather than checking once too early.
     opened = False
-    try:
-        named = page.get_by_role("combobox", name=re.compile(r"language|язык", re.I))
-        if named.count():
-            named.first.click(timeout=3_000)
-            opened = True
-    except Exception:
-        opened = False
-    if not opened:
+    for _ in range(5):
         try:
-            page.get_by_role("combobox").first.click(timeout=3_000)
-            opened = True
+            named = page.get_by_role("combobox", name=re.compile(r"language|язык", re.I))
+            if named.count():
+                named.first.click(timeout=2_000)
+                opened = True
+                break
+            any_cb = page.get_by_role("combobox")
+            if any_cb.count():
+                any_cb.first.click(timeout=2_000)
+                opened = True
+                break
         except Exception as e:
-            _log(f"combobox open failed: {e}")
-            return False
+            _log(f"combobox open error: {e}")
+        try:
+            page.wait_for_timeout(800)
+        except Exception:
+            pass
+    if not opened:
+        _log("language combobox not found (settings/Captions tab not open)")
+        return False
     try:
         page.wait_for_timeout(800)
     except Exception:
@@ -804,6 +823,8 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
             last_caption_enable = 0.0
             caption_lang = os.environ.get("HERMES_MEET_CAPTION_LANG", "").strip()
             caption_lang_done = False
+            last_lang_try = 0.0
+            lang_attempts = 0
             while not stop_flag["stop"]:
                 now = time.time()
                 if deadline and now > deadline:
@@ -856,16 +877,28 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
                         state.set(captions_enabled_attempted=True)
                     except Exception:
                         pass
-                    # Once captions are on, set the caption language (once) so
-                    # Meet transcribes the spoken language — otherwise the
-                    # default (often English) yields an empty transcript for
-                    # other languages. Env-gated; unset => leave Meet's default.
-                    if caption_lang and not caption_lang_done:
-                        try:
-                            if _set_caption_language(page, caption_lang):
-                                caption_lang_done = True
-                        except Exception:
-                            pass
+
+                # Force the caption language (env-gated; runner sets Russian).
+                # Decoupled from the transcript gate above: the caption-settings
+                # entry only appears once the caption overlay has rendered, which
+                # can be after the first lines arrive — so retry on its own
+                # cadence after admission until it succeeds or we exhaust tries.
+                # This is belt-and-suspenders: the language is ALSO sticky in the
+                # persistent Chrome profile, which is the primary guarantee.
+                if (
+                    caption_lang
+                    and state.in_call
+                    and not caption_lang_done
+                    and lang_attempts < 12
+                    and (now - last_lang_try) > 3.0
+                ):
+                    last_lang_try = now
+                    lang_attempts += 1
+                    try:
+                        if _set_caption_language(page, caption_lang):
+                            caption_lang_done = True
+                    except Exception:
+                        pass
 
                 try:
                     queued = page.evaluate("window.__hermesMeetDrain && window.__hermesMeetDrain()")
@@ -1052,11 +1085,12 @@ def _detect_admission(page) -> bool:
     probe = r"""
     (() => {
       const buttons = Array.from(document.querySelectorAll('button'));
-      // 1) Hangup button — 'call_end' ligature (locale-independent) or RU/EN aria.
+      // 1) In-call leave button by RU/EN aria text. NOTE: do NOT anchor on the
+      // 'call_end' ligature here — the LOBBY's cancel/hangup button also uses
+      // 'call_end', which would false-positive admission while still waiting.
       const leave = buttons.find((b) => {
         const text = `${b.innerText || ''} ${b.getAttribute('aria-label') || ''}`;
-        return /call_end/i.test(b.innerText || '')
-          || /leave call|leave meeting|покинуть видеовстреч|покинуть вызов|покинуть звон|выйти из вызова|выйти из звон/i.test(text);
+        return /leave call|leave meeting|покинуть видеовстреч|покинуть вызов|покинуть звон|выйти из вызова|выйти из звон/i.test(text);
       });
       if (leave) return true;
       // 2) Caption region appeared — RU/EN aria (Captions/Субтитры) + current jsname.
