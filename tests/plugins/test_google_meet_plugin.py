@@ -675,6 +675,160 @@ def test_detect_admission_true_when_probe_returns_true():
     assert _detect_admission(_FakePage()) is True
 
 
+def test_try_guest_name_uses_fallback_textbox_role():
+    from plugins.google_meet.meet_bot import _try_guest_name
+
+    class _EmptyLocator:
+        first = None
+
+        def __init__(self):
+            self.first = self
+
+        def count(self):
+            return 0
+
+        def is_visible(self):
+            return False
+
+    class _Textbox:
+        def __init__(self):
+            self.filled = None
+            self.first = self
+
+        def count(self):
+            return 1
+
+        def is_visible(self):
+            return True
+
+        def fill(self, value, timeout=None):
+            self.filled = value
+
+    class _FakePage:
+        def __init__(self):
+            self.textbox = _Textbox()
+
+        def locator(self, _selector):
+            return _EmptyLocator()
+
+        def get_by_role(self, role):
+            assert role == "textbox"
+            return self.textbox
+
+    page = _FakePage()
+    _try_guest_name(page, "Verter")
+    assert page.textbox.filled == "Verter"
+
+
+def test_click_join_supports_russian_role_label(tmp_path):
+    from plugins.google_meet.meet_bot import _BotState, _click_join
+
+    class _FakeButton:
+        def __init__(self, visible):
+            self.visible = visible
+            self.clicked = False
+
+        def count(self):
+            return 1
+
+        def is_visible(self):
+            return self.visible
+
+        def inner_text(self, timeout=None):
+            return "Присоединиться"
+
+        def get_attribute(self, name, timeout=None):
+            return None
+
+        def click(self, timeout=None):
+            self.clicked = True
+
+    class _FakeLocator:
+        def __init__(self, button):
+            self.first = button
+
+    class _FakePage:
+        def __init__(self):
+            self.ru_button = _FakeButton(True)
+
+        def get_by_role(self, role, name, exact=False):
+            if name == "Присоединиться":
+                return _FakeLocator(self.ru_button)
+            return _FakeLocator(_FakeButton(False))
+
+    page = _FakePage()
+    state = _BotState(out_dir=tmp_path / "s", meeting_id="abc-defg-hij",
+                      url="https://meet.google.com/abc-defg-hij")
+    assert _click_join(page, state) is True
+    assert page.ru_button.clicked is True
+
+
+def test_click_join_uses_dom_fallback_when_role_locator_misses(tmp_path):
+    from plugins.google_meet.meet_bot import _BotState, _click_join
+
+    class _FakeButton:
+        def count(self):
+            return 0
+
+        def is_visible(self):
+            return False
+
+    class _FakeLocator:
+        first = _FakeButton()
+
+    class _FakePage:
+        def __init__(self):
+            self.dom_clicked = False
+
+        def get_by_role(self, role, name, exact=False):
+            return _FakeLocator()
+
+        def evaluate(self, js):
+            assert "Присоединиться" in js
+            self.dom_clicked = True
+            return {
+                "clicked": True,
+                "inner": "Присоединиться",
+                "aria": "Отправить запрос на подключение без использования камеры",
+                "waitsForLobby": False,
+            }
+
+    page = _FakePage()
+    state = _BotState(out_dir=tmp_path / "s", meeting_id="abc-defg-hij",
+                      url="https://meet.google.com/abc-defg-hij")
+    assert _click_join(page, state) is True
+    assert page.dom_clicked is True
+    assert state.lobby_waiting is False
+
+
+def test_click_join_does_not_include_speculative_labels():
+    import inspect
+    from plugins.google_meet.meet_bot import _click_join
+
+    source = inspect.getsource(_click_join)
+    assert "/^Join now$/i" in source
+    assert "/^Ask to join$/i" in source
+    assert "/^Присоединиться$/i" in source
+    for label in (
+        "Подключиться",
+        "Tham gia ngay",
+        "Yêu cầu tham gia",
+        "Попросить присоединиться",
+        "Запросить присоединение",
+        "Запросить доступ",
+    ):
+        assert label not in source
+
+
+def test_run_bot_does_not_exit_early_when_join_button_is_missing():
+    import inspect
+    from plugins.google_meet.meet_bot import run_bot
+
+    source = inspect.getsource(run_bot)
+    assert 'state.set(error="join button not clicked", exited=True)' not in source
+    assert 'return 5' not in source
+
+
 def test_detect_denied_returns_false_on_error():
     from plugins.google_meet.meet_bot import _detect_denied
 

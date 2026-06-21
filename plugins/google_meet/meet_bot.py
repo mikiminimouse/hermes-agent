@@ -522,19 +522,14 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
             rt["bridge"].teardown()
         return 3
 
-    # Chrome env: if realtime is live on Linux, point PULSE_SOURCE at the
-    # virtual source so Chrome's fake mic reads the audio we generate.
+    # Chrome env: only realtime mode needs an input device. Transcribe mode is
+    # receive-only and must not publish Chromium's fake microphone tone into Meet.
     chrome_env = os.environ.copy()
-    chrome_args = [
-        "--use-fake-ui-for-media-stream",
-        "--disable-blink-features=AutomationControlled",
-    ]
-    if not rt["enabled"]:
-        # v1-style fake device (silence) — we don't care about mic content
-        # when we're not speaking.
-        chrome_args.insert(1, "--use-fake-device-for-media-stream")
-    elif rt["bridge_info"] and rt["bridge_info"].get("platform") == "linux":
-        chrome_env["PULSE_SOURCE"] = rt["bridge_info"].get("device_name", "")
+    chrome_args = ["--disable-blink-features=AutomationControlled"]
+    if rt["enabled"]:
+        chrome_args.insert(0, "--use-fake-ui-for-media-stream")
+        if rt["bridge_info"] and rt["bridge_info"].get("platform") == "linux":
+            chrome_env["PULSE_SOURCE"] = rt["bridge_info"].get("device_name", "")
 
     try:
         with sync_playwright() as pw:
@@ -552,8 +547,9 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
                     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
                 ),
-                "permissions": ["microphone", "camera"],
             }
+            if rt["enabled"]:
+                context_args["permissions"] = ["microphone", "camera"]
             if auth_state and Path(auth_state).is_file():
                 context_args["storage_state"] = auth_state
             context = browser.new_context(**context_args)
@@ -568,7 +564,27 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
             # Guest-mode: Meet shows a name field before "Ask to join". When
             # we're authed, we instead see "Join now".
             _try_guest_name(page, guest_name)
-            _click_join(page, state)
+            join_clicked = _click_join(page, state)
+            if not join_clicked:
+                try:
+                    debug = page.evaluate(
+                        r"""
+                        () => ({
+                          url: location.href,
+                          text: (document.body && document.body.innerText || '').slice(0, 2000),
+                          buttons: Array.from(document.querySelectorAll('button')).map((b, i) => ({
+                            i,
+                            inner: (b.innerText || '').trim(),
+                            aria: (b.getAttribute('aria-label') || '').trim(),
+                            visible: !!(b.offsetWidth || b.offsetHeight || b.getClientRects().length),
+                            disabled: b.disabled || b.getAttribute('aria-disabled') === 'true',
+                          })).filter((x) => x.visible),
+                        })
+                        """
+                    )
+                    print(f"[meet_bot] join button not clicked; continuing admission loop debug={debug!r}", flush=True)
+                except Exception as e:
+                    print(f"[meet_bot] join button debug failed: {e!r}", flush=True)
 
             # Install caption observer and attempt to enable captions.
             try:
@@ -735,12 +751,35 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
 
 
 def _try_guest_name(page, guest_name: str) -> None:
-    """If Meet is showing a guest-name input, type *guest_name* into it."""
+    """If Meet is showing a guest-name field, type *guest_name* into it."""
     try:
-        # Meet's guest name input has placeholder "Your name".
-        locator = page.locator('input[aria-label*="name" i]').first
-        if locator.count() and locator.is_visible():
-            locator.fill(guest_name, timeout=2_000)
+        got_it = page.get_by_role("button", name="Got it", exact=True).first
+        if got_it.count() and got_it.is_visible():
+            got_it.click(timeout=2_000)
+            page.wait_for_timeout(500)
+    except Exception:
+        pass
+
+    selectors = (
+        'input[aria-label*="name" i]',
+        'input[placeholder*="name" i]',
+        'textarea[aria-label*="name" i]',
+        'textarea[placeholder*="name" i]',
+        '[role="textbox"][aria-label*="name" i]',
+        '[contenteditable="true"][aria-label*="name" i]',
+    )
+    for selector in selectors:
+        try:
+            locator = page.locator(selector).first
+            if locator.count() and locator.is_visible():
+                locator.fill(guest_name, timeout=2_000)
+                return
+        except Exception:
+            continue
+    try:
+        textbox = page.get_by_role("textbox").first
+        if textbox.count() and textbox.is_visible():
+            textbox.fill(guest_name, timeout=2_000)
     except Exception:
         pass
 
@@ -760,7 +799,11 @@ def _detect_admission(page) -> bool:
     """
     probe = r"""
     (() => {
-      const leave = document.querySelector('button[aria-label*="eave call" i]');
+      const buttons = Array.from(document.querySelectorAll('button'));
+      const leave = buttons.find((b) => {
+        const text = `${b.innerText || ''} ${b.getAttribute('aria-label') || ''}`;
+        return /leave call|leave meeting|покинуть видеовстречу|покинуть вызов|покинуть звонок|выйти из вызова|выйти из звонка/i.test(text);
+      });
       if (leave) return true;
       if (window.__hermesMeetInstalled) {
         const caps = document.querySelector(
@@ -819,22 +862,89 @@ def _looks_like_human_speaker(speaker: str, bot_guest_name: str) -> bool:
     return True
 
 
-def _click_join(page, state: _BotState) -> None:
-    """Click 'Join now' or 'Ask to join' if either button is visible.
+def _click_join(page, state: _BotState) -> bool:
+    """Click the Meet join/request button if it is visible.
+
+    Meet localizes the pre-join UI, and in headless mode Playwright's
+    accessible role locator can miss a visible DOM button such as Russian
+    ``Присоединиться``. Try role-based labels first, then fall back to a
+    direct DOM button scan by innerText/aria-label. The button can appear a
+    few seconds after DOMContentLoaded, so this helper waits briefly while
+    keeping the original run_bot call-site unchanged.
 
     Flags ``lobby_waiting`` when we hit the "waiting for host to admit you"
     state so the agent can surface that in status.
     """
-    for label in ("Join now", "Ask to join"):
+    candidates = (
+        ("Join now", False),
+        ("Ask to join", True),
+        ("Присоединиться", False),
+    )
+    deadline = time.time() + 20.0
+    while time.time() < deadline:
         try:
-            btn = page.get_by_role("button", name=label, exact=False).first
-            if btn.count() and btn.is_visible():
-                btn.click(timeout=3_000)
-                if label == "Ask to join":
-                    state.set(lobby_waiting=True)
-                break
+            page.evaluate(
+                r"""
+                () => {
+                  const b = Array.from(document.querySelectorAll('button')).find((btn) => {
+                    const text = `${btn.innerText || ''} ${btn.getAttribute('aria-label') || ''}`;
+                    return /don't use microphone|do not use microphone|не включать микрофон/i.test(text);
+                  });
+                  if (b) { b.click(); return true; }
+                  return false;
+                }
+                """
+            )
         except Exception:
-            continue
+            pass
+
+        for label, waits_for_lobby in candidates:
+            try:
+                btn = page.get_by_role("button", name=label, exact=False).first
+                if btn.count() and btn.is_visible():
+                    btn.click(timeout=3_000)
+                    if waits_for_lobby:
+                        state.set(lobby_waiting=True)
+                    return True
+            except Exception:
+                continue
+
+        try:
+            clicked = page.evaluate(
+                r"""
+                () => {
+                  const labels = [
+                    { rx: /^Join now$/i, waitsForLobby: false },
+                    { rx: /^Ask to join$/i, waitsForLobby: true },
+                    { rx: /^Присоединиться$/i, waitsForLobby: false },
+                  ];
+                  for (const b of Array.from(document.querySelectorAll('button'))) {
+                    const inner = (b.innerText || '').trim();
+                    const aria = (b.getAttribute('aria-label') || '').trim();
+                    const visible = !!(b.offsetWidth || b.offsetHeight || b.getClientRects().length);
+                    const disabled = b.disabled || b.getAttribute('aria-disabled') === 'true';
+                    if (!visible || disabled) continue;
+                    const match = labels.find((label) => label.rx.test(inner) || label.rx.test(aria));
+                    if (match) {
+                      b.click();
+                      return { clicked: true, inner, aria, waitsForLobby: match.waitsForLobby };
+                    }
+                  }
+                  return { clicked: false };
+                }
+                """
+            )
+            if isinstance(clicked, dict) and clicked.get("clicked"):
+                if clicked.get("waitsForLobby"):
+                    state.set(lobby_waiting=True)
+                return True
+        except Exception:
+            pass
+        try:
+            page.wait_for_timeout(1000)
+        except Exception:
+            time.sleep(1.0)
+    return False
 
 
 def _parse_duration(raw: str) -> Optional[float]:
