@@ -170,6 +170,12 @@ def start(
         "HERMES_MEET_LEAVE_WHEN_ALONE",
         "HERMES_MEET_ALONE_TIMEOUT",
         "HERMES_MEET_SUMMARY_CMD",
+        "HERMES_MEET_TTS",
+        "HERMES_MEET_PIPER_VOICE",
+        "HERMES_MEET_PIPER_VOICES_DIR",
+        "HERMES_MEET_PIPER_LENGTH_SCALE",
+        "HERMES_MEET_SILERO_VOICE",
+        "HERMES_MEET_SILERO_RATE",
     ):
         _v = os.environ.get(_k)
         if _v:

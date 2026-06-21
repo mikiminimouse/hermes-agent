@@ -844,7 +844,7 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
             # auto-gain that suppress our steady loopback (virtual-mic) audio as
             # "noise". Best-effort: Chrome may keep some processing, but this
             # removes the constraint-driven suppression of synthetic speech.
-            if os.environ.get("HERMES_MEET_MODE", "").strip().lower() == "realtime":
+            if mode == "realtime":
                 try:
                     page.add_init_script(
                         """(() => {
@@ -879,25 +879,26 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
             _try_guest_name(page, guest_name)
             join_clicked = _click_join(page, state)
             if not join_clicked:
-                try:
-                    debug = page.evaluate(
-                        r"""
-                        () => ({
-                          url: location.href,
-                          text: (document.body && document.body.innerText || '').slice(0, 2000),
-                          buttons: Array.from(document.querySelectorAll('button')).map((b, i) => ({
-                            i,
-                            inner: (b.innerText || '').trim(),
-                            aria: (b.getAttribute('aria-label') || '').trim(),
-                            visible: !!(b.offsetWidth || b.offsetHeight || b.getClientRects().length),
-                            disabled: b.disabled || b.getAttribute('aria-disabled') === 'true',
-                          })).filter((x) => x.visible),
-                        })
-                        """
-                    )
-                    print(f"[meet_bot] join button not clicked; continuing admission loop debug={debug!r}", flush=True)
-                except Exception as e:
-                    print(f"[meet_bot] join button debug failed: {e!r}", flush=True)
+                if os.environ.get('HERMES_MEET_DEBUG_MODE', '').lower() in ('1', 'true', 'yes'):
+                    try:
+                        debug = page.evaluate(
+                            r"""
+                            () => ({
+                              url: location.href,
+                              text: (document.body && document.body.innerText || '').slice(0, 2000),
+                              buttons: Array.from(document.querySelectorAll('button')).map((b, i) => ({
+                                i,
+                                inner: (b.innerText || '').trim(),
+                                aria: (b.getAttribute('aria-label') || '').trim(),
+                                visible: !!(b.offsetWidth || b.offsetHeight || b.getClientRects().length),
+                                disabled: b.disabled || b.getAttribute('aria-disabled') === 'true',
+                              })).filter((x) => x.visible),
+                            })
+                            """
+                        )
+                        print(f"[meet_bot] join button not clicked; continuing admission loop debug={debug!r}", flush=True)
+                    except Exception as e:
+                        print(f"[meet_bot] join button debug failed: {e!r}", flush=True)
 
             # Install the caption observer now — it retries on an interval
             # until the caption region appears. Enabling captions is DEFERRED
@@ -1512,7 +1513,7 @@ def _click_join(page, state: _BotState) -> bool:
                   return true;
                 }
                 """,
-                os.environ.get("HERMES_MEET_MODE", "").strip().lower() == "realtime",
+                mode == "realtime",
             )
         except Exception:
             pass
