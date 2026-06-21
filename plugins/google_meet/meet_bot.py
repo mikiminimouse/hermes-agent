@@ -509,6 +509,11 @@ def _start_realtime_speaker(
                     "--format=s16le",
                     "--channels=1",
                     f"--device={sink}",
+                    # Buffer ~250ms so brief gaps between the tailer's PCM writes
+                    # (sentence boundaries / EOF polls) don't underrun the sink
+                    # and cause occasional audible stutter. Cheap latency for
+                    # smooth playback; far less than the Meet caption lag anyway.
+                    "--latency-msec=250",
                 ],
                 stdin=_sp.PIPE,
                 stdout=_sp.DEVNULL,
