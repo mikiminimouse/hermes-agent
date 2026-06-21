@@ -172,6 +172,36 @@ class _BotState:
             setattr(self, k, v)
         self._flush()
 
+    # -------- end-of-meeting summary signal ----------------------------
+
+    def request_summary(self) -> Optional["Path"]:
+        """Drop a ``summary_request.json`` marker in the meeting dir.
+
+        Written only when the meeting was actually attended and has content
+        (so denied/lobby-timeout never request a summary). This file is the
+        contract a post-call summarizer watches for: the bot never runs the
+        LLM itself (it has no model/key) — an external hook or the Hermes
+        agent picks up the marker and produces ``report.md``. Returns the
+        marker path, or None if there was nothing to summarize.
+        """
+        if self.joined_at is None or self.transcript_lines <= 0:
+            return None
+        marker = self.out_dir / "summary_request.json"
+        payload = {
+            "meetingId": self.meeting_id,
+            "url": self.url,
+            "transcriptPath": str(self.transcript_path),
+            "transcriptLines": self.transcript_lines,
+            "leaveReason": self.leave_reason,
+            "endedAt": time.time(),
+            "reportPath": str(self.out_dir / "report.md"),
+            "status": "pending",
+        }
+        tmp = marker.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp.replace(marker)
+        return marker
+
 
 # ---------------------------------------------------------------------------
 # Playwright bot entry point
@@ -923,6 +953,18 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
             last_lang_try = 0.0
             lang_attempts = 0
             mic_unmute_attempts = 0
+            # Auto-end on empty meeting. Only arm AFTER the bot has seen company
+            # (≥2 participants) at least once — otherwise a bot that joins before
+            # the host would immediately "leave alone" in an empty room. Once
+            # everyone else has gone for HERMES_MEET_ALONE_TIMEOUT seconds, leave
+            # with leave_reason="alone" so the caller can trigger summarization.
+            leave_when_alone = os.environ.get(
+                "HERMES_MEET_LEAVE_WHEN_ALONE", "1"
+            ).strip().lower() not in ("0", "false", "no", "")
+            alone_timeout = float(os.environ.get("HERMES_MEET_ALONE_TIMEOUT", "90"))
+            ever_had_company = False
+            alone_since: Optional[float] = None
+            last_alone_check = 0.0
             while not stop_flag["stop"]:
                 now = time.time()
                 if deadline and now > deadline:
@@ -973,6 +1015,23 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
                             leave_reason="lobby_timeout",
                         )
                         break
+
+                # Empty-meeting auto-end (throttled ~5s). _detect_alone is
+                # conservative (False on any ambiguity), so we additionally
+                # require the alone state to PERSIST for alone_timeout before
+                # leaving — a momentary tile-count blip won't end the call.
+                if leave_when_alone and state.in_call and (now - last_alone_check) > 5.0:
+                    last_alone_check = now
+                    alone = _detect_alone(page)
+                    if not alone:
+                        ever_had_company = True
+                        alone_since = None
+                    elif ever_had_company:
+                        if alone_since is None:
+                            alone_since = now
+                        elif (now - alone_since) >= alone_timeout:
+                            state.set(leave_reason="alone")
+                            break
 
                 # Captions can only be turned on in-call, so enable them after
                 # admission. Keep retrying (throttled ~3s) until captions
@@ -1099,6 +1158,34 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
                     rt["bridge"].teardown()
                 except Exception:
                     pass
+            # End-of-meeting summary signal. Only for graceful ends where the
+            # bot actually attended (alone / duration / host-left / explicit
+            # leave / page closed) — never for denied or lobby_timeout, which
+            # request_summary() also guards by joined_at/transcript_lines.
+            GRACEFUL_END = {"alone", "duration_expired", "meet_leave", "page_closed", None}
+            if state.leave_reason in GRACEFUL_END:
+                try:
+                    marker = state.request_summary()
+                except Exception:
+                    marker = None
+                # Optional auto-trigger: a hook command (e.g. a wrapper that
+                # invokes the Hermes agent / codex to run meet-post-call-summary)
+                # gets the meeting dir as its single argument. Detached so bot
+                # teardown isn't blocked on summarization.
+                summary_cmd = os.environ.get("HERMES_MEET_SUMMARY_CMD", "").strip()
+                if marker is not None and summary_cmd:
+                    try:
+                        import shlex
+                        import subprocess
+                        subprocess.Popen(
+                            shlex.split(summary_cmd) + [str(state.out_dir)],
+                            stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            start_new_session=True,
+                        )
+                    except Exception:
+                        pass
             state.set(in_call=False, captioning=False, exited=True)
             return 0
 
@@ -1229,6 +1316,42 @@ def _detect_admission(page) -> bool:
       if (parts) return true;
       const partBtn = buttons.some((b) => /^(people|group)$/i.test((b.innerText || '').trim()));
       if (partBtn) return true;
+      return false;
+    })();
+    """
+    try:
+        return bool(page.evaluate(probe))
+    except Exception:
+        return False
+
+
+def _detect_alone(page) -> bool:
+    """True when the bot is the ONLY participant left (everyone else has gone).
+
+    Used to auto-end the meeting (and trigger summarization) once the humans
+    leave. Two signals: Meet's "no one else" copy (RU+EN), and a participant
+    count of 1 parsed from the people button / call header. Conservative:
+    returns False on any error or ambiguity (better to linger than leave early).
+    """
+    probe = r"""
+    (() => {
+      const body = document.body ? (document.body.innerText || '') : '';
+      // 1) Explicit "you're alone" copy.
+      if (/no one else is here|you'?re the only one|everyone else (has )?left|waiting for others to join/i.test(body)) return true;
+      if (/кроме вас,? здесь больше никого|вы единственный участник|все остальные вышли|больше никого нет/i.test(body)) return true;
+      // 2) Participant count == 1 (people button / aria like "Participants, 1"
+      //    or RU "Участники, 1"). Only trust an explicit numeric count.
+      const els = [...document.querySelectorAll('button,[role="button"],[aria-label]')];
+      for (const e of els) {
+        const a = e.getAttribute('aria-label') || '';
+        const m = a.match(/(participants|people|участник[аи]?)\D{0,4}(\d+)/i)
+               || a.match(/(\d+)\D{0,4}(participants|people|участник)/i);
+        if (m) {
+          const n = parseInt(m[2] && /\d/.test(m[2]) ? m[2] : m[1], 10);
+          if (n === 1) return true;
+          if (n >= 2) return false;
+        }
+      }
       return false;
     })();
     """

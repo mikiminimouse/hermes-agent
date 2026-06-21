@@ -115,6 +115,42 @@ def test_bot_state_ignores_blank_text(tmp_path):
     assert "Unknown: text but no speaker" in (tmp_path / "s" / "transcript.txt").read_text()
 
 
+def test_request_summary_writes_marker_when_attended(tmp_path):
+    from plugins.google_meet.meet_bot import _BotState
+
+    out = tmp_path / "session"
+    state = _BotState(out_dir=out, meeting_id="abc-defg-hij",
+                      url="https://meet.google.com/abc-defg-hij")
+    # Simulate an attended meeting with content.
+    state.set(joined_at=1.0, leave_reason="alone")
+    state.record_caption("Alice", "Discussed the roadmap")
+
+    marker = state.request_summary()
+    assert marker is not None and marker.exists()
+    data = json.loads(marker.read_text())
+    assert data["status"] == "pending"
+    assert data["leaveReason"] == "alone"
+    assert data["transcriptLines"] == 1
+    assert data["reportPath"].endswith("report.md")
+
+
+def test_request_summary_skips_when_never_joined_or_empty(tmp_path):
+    from plugins.google_meet.meet_bot import _BotState
+
+    # Never joined (denied/lobby_timeout): no marker.
+    s1 = _BotState(out_dir=tmp_path / "a", meeting_id="x-y-z",
+                   url="https://meet.google.com/x-y-z")
+    s1.set(leave_reason="denied")
+    assert s1.request_summary() is None
+    assert not (tmp_path / "a" / "summary_request.json").exists()
+
+    # Joined but no captions captured: nothing to summarize.
+    s2 = _BotState(out_dir=tmp_path / "b", meeting_id="x-y-z",
+                   url="https://meet.google.com/x-y-z")
+    s2.set(joined_at=1.0, leave_reason="duration_expired")
+    assert s2.request_summary() is None
+
+
 def test_parse_duration():
     from plugins.google_meet.meet_bot import _parse_duration
 
