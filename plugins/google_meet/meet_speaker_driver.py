@@ -247,17 +247,25 @@ def main(argv) -> int:
             return 1
         time.sleep(2)
 
-    # 2) Greet once. The realtime session can report ready a beat before Silero
-    # finishes loading, so the first greeting may produce no audio — re-say it
-    # once if audioBytesOut hasn't moved.
+    # 2) Greet — and VERIFY it was actually voiced. Even with the Silero warm-up
+    # in connect(), the audio pipeline (pump/sink) can need a moment, so retry up
+    # to 3x, each time confirming audioBytesOut actually grew before moving on.
     st = pm.status()
     greeting = _greeting(st)
-    _say(greeting)
-    _log(out_dir, "greeted")
-    time.sleep(6)
-    if not (pm.status().get("audioBytesOut") or 0):
+    for attempt in range(3):
+        before = pm.status().get("audioBytesOut") or 0
         _say(greeting)
-        _log(out_dir, "re-greeted (first produced no audio)")
+        _log(out_dir, f"greet attempt {attempt + 1}")
+        voiced = False
+        for _ in range(8):                     # wait up to ~8s for audio to flow
+            time.sleep(1)
+            if (pm.status().get("audioBytesOut") or 0) > before:
+                voiced = True
+                break
+        if voiced:
+            _log(out_dir, "greeting voiced ✓")
+            break
+        _log(out_dir, "greeting produced no audio — retrying")
 
     # 3) Conversation loop — deterministic cadence, point-wise LLM calls.
     cursor = -1

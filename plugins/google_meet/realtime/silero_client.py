@@ -77,6 +77,15 @@ class SileroSpeaker:
             model.to("cpu")
             _MODEL_CACHE[cache_key] = model
         self._model = _MODEL_CACHE[cache_key]
+        # Warm up: the FIRST apply_tts() pays a cold-start cost (graph/alloc/JIT)
+        # that otherwise lands on the greeting and can make it arrive late or get
+        # dropped. Do one throwaway synth now (NOT written to the sink, so nothing
+        # leaks into the meeting) — connect() returns only once the speaker can
+        # produce audio instantly, so realtime_ready truly means "can speak".
+        try:
+            self._synth_pcm("Готово.")
+        except Exception:
+            pass
 
     def _synth_pcm(self, sentence: str) -> bytes:
         import numpy as np
