@@ -1713,6 +1713,10 @@ def _detect_admission(page) -> bool:
       // button cannot distinguish lobby from call. The lobby is identified by
       // its "waiting for host" copy instead — if present, we are NOT admitted.
       const body = document.body ? (document.body.innerText || '') : '';
+      // DOM-not-loaded guard: an empty/short body means the page is mid-load —
+      // declaring admission here was the empty-body race that latched in_call in
+      // the lobby. Wait for a real render.
+      if (!body || body.trim().length < 40) return false;
       if (/please wait until|asking to be let in|wait(ing)? for the host|you'?ll join the call when|подождите,? пока|вас впуст|ожидайте|организатор.*впуст|запрос на присоединение отправлен/i.test(body)) {
         return false;
       }
@@ -1731,9 +1735,18 @@ def _detect_admission(page) -> bool:
         return /leave call|leave meeting|покинуть видеовстреч|покинуть вызов|покинуть звон|выйти из вызова|выйти из звон/i.test(text);
       });
       if (leave) return true;
-      // (Removed caption-region check: the observer + caption container exist on
-      // the pre-join screen too, so it false-positived admission in the lobby.
-      // The leave button + participants panel below are in-call-only signals.)
+      // 2) In-call toolbar ligatures: the hangup (call_end) + chat buttons. The
+      // lobby/pre-join screens were already excluded by the guards above, and the
+      // device-preview has Join/Ask-to-join (no call_end, no chat) — so on a
+      // loaded non-lobby page these mean we ARE in the call. (Replaces the old
+      // caption-region check, which existed pre-admission and false-positived.)
+      const inCallBtn = buttons.some((b) => {
+        const inner = (b.innerText || '').trim().toLowerCase();
+        const aria = (b.getAttribute('aria-label') || '').toLowerCase();
+        return inner === 'call_end' || inner === 'chat'
+            || /chat with everyone|чат с участ/.test(aria);
+      });
+      if (inCallBtn) return true;
       // 3) Participants container — RU/EN aria or people/group ligature button.
       const parts = document.querySelector(
         '[aria-label*="articipants" i], [aria-label*="участник" i]'
