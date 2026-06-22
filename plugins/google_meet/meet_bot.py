@@ -1716,21 +1716,24 @@ def _detect_admission(page) -> bool:
       if (/please wait until|asking to be let in|wait(ing)? for the host|you'?ll join the call when|подождите,? пока|вас впуст|ожидайте|организатор.*впуст|запрос на присоединение отправлен/i.test(body)) {
         return false;
       }
+      // PRE-JOIN GUARD: if a join / ask-to-join button is on screen we're on the
+      // device-preview/lobby page, NOT admitted. The caption container + observer
+      // can already exist here, which falsely tripped the old caption-region
+      // check and latched in_call=True while still in the lobby.
+      const joinBtn = buttons.find((b) => {
+        const t = `${b.innerText || ''} ${b.getAttribute('aria-label') || ''}`.toLowerCase();
+        return /join now|ask to join|switch here|присоедин|попросить присоедин/.test(t);
+      });
+      if (joinBtn) return false;
       // 1) In-call leave button by RU/EN aria text.
       const leave = buttons.find((b) => {
         const text = `${b.innerText || ''} ${b.getAttribute('aria-label') || ''}`;
         return /leave call|leave meeting|покинуть видеовстреч|покинуть вызов|покинуть звон|выйти из вызова|выйти из звон/i.test(text);
       });
       if (leave) return true;
-      // 2) Caption region appeared — RU/EN aria (Captions/Субтитры) + current jsname.
-      if (window.__hermesMeetInstalled) {
-        const caps = document.querySelector(
-          '[role="region"][aria-label*="aption" i], ' +
-          '[role="region"][aria-label*="убтитр" i], ' +
-          'div[jsname="dsyhDe"]'
-        );
-        if (caps) return true;
-      }
+      // (Removed caption-region check: the observer + caption container exist on
+      // the pre-join screen too, so it false-positived admission in the lobby.
+      // The leave button + participants panel below are in-call-only signals.)
       // 3) Participants container — RU/EN aria or people/group ligature button.
       const parts = document.querySelector(
         '[aria-label*="articipants" i], [aria-label*="участник" i]'
