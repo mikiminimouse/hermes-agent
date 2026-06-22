@@ -71,6 +71,11 @@ MAX_CTX_LINES = 24            # rolling dialogue context fed to the LLM
 # everyone said bye and dropped — independent of _detect_alone/participantCount.
 END_GRACE = float(os.environ.get("DRIVER_END_GRACE", "25"))
 MAX_IDLE = float(os.environ.get("DRIVER_MAX_IDLE", "300"))
+# Reply-dedup: don't re-voice a reply that's similar to ANY of the last few
+# (not just the last one) within a window — stops "да, я на связи" cycling when
+# the user re-asks similar things. Lower ratio + longer window than before.
+REPLY_DEDUP_RATIO = float(os.environ.get("DRIVER_REPLY_DEDUP_RATIO", "0.72"))
+REPLY_DEDUP_WINDOW = float(os.environ.get("DRIVER_REPLY_DEDUP_WINDOW", "90"))
 HEAVY_TIMEOUT = float(os.environ.get("DRIVER_HEAVY_TIMEOUT", "900"))
 MAX_HEAVY = int(os.environ.get("DRIVER_MAX_HEAVY", "1"))  # concurrent bg agents
 # PATH for the background tool-capable agent (hermes CLI + nvm node for codex).
@@ -279,7 +284,7 @@ def main(argv) -> int:
     convo: list = []          # rolling "Speaker: text" of the whole dialogue
     addressed = False         # bot was explicitly addressed in the new lines
     farewelled = False        # we've already said our goodbye
-    last_reply = {"text": "", "at": 0.0}   # for reply-dedup (don't repeat verbatim)
+    recent_replies: list = []   # [(norm, at)] for reply-dedup across last few
     last_human_at = time.time()   # presence signal: when a human last spoke
     had_human = False
     while True:
@@ -341,16 +346,19 @@ def main(argv) -> int:
                 _say(msg)
                 _log(out_dir, f"delegate→ {msg[:32]} | {task[:60]}")
             else:
-                # Reply-dedup: don't repeat a near-identical line within ~45s
-                # (avoids "Да, я на связи" said a dozen times to repeated pings).
+                # Reply-dedup across the last few replies (not just the last) so
+                # an A/B/A/B cycle of near-identical answers can't slip through.
                 now2 = time.time()
-                if (difflib.SequenceMatcher(
-                        None, _norm_task(reply), _norm_task(last_reply["text"])
-                    ).ratio() >= 0.8 and (now2 - last_reply["at"]) < 45):
+                rnorm = _norm_task(reply)
+                recent_replies = [(t, a) for (t, a) in recent_replies
+                                  if now2 - a < REPLY_DEDUP_WINDOW]
+                dup = any(difflib.SequenceMatcher(None, rnorm, t).ratio() >= REPLY_DEDUP_RATIO
+                          for (t, a) in recent_replies)
+                if dup:
                     _log(out_dir, "skip dup reply")
                 else:
                     _say(reply)
-                    last_reply = {"text": reply, "at": now2}
+                    recent_replies.append((rnorm, now2))
                     _log(out_dir, f"said: {reply[:80]}")
 
         # End the meeting from the DIALOGUE (no reliance on participantCount):
