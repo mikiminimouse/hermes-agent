@@ -44,48 +44,88 @@ from plugins.google_meet.meet_bot import _is_farewell_candidate  # noqa: E402
 from agent.auxiliary_client import call_llm  # noqa: E402
 from agent.plugin_llm import _extract_text  # noqa: E402
 
+# ---------------------------------------------------------------------------
+# Tunable thresholds (THRESHOLDS). Every magic number lives here with its
+# rationale + an env override, so the driver can be tuned on a live call without
+# a code edit. Values are validated on import (fail fast on a typo'd env), so an
+# out-of-range override raises instead of silently degrading. See
+# docs/MEET_AGENT_RUNBOOK.md §6g.
+# ---------------------------------------------------------------------------
+def _envf(name: str, default: float, lo: float, hi: float) -> float:
+    try:
+        v = float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        v = float(default)
+    if not (lo <= v <= hi):
+        raise ValueError(f"{name}={v} out of range [{lo}, {hi}]")
+    return v
+
+
+def _envi(name: str, default: int, lo: int, hi: int) -> int:
+    try:
+        v = int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        v = int(default)
+    if not (lo <= v <= hi):
+        raise ValueError(f"{name}={v} out of range [{lo}, {hi}]")
+    return v
+
+
+MODEL = os.environ.get("DRIVER_MODEL", "gpt-5.5")
+PROVIDER = os.environ.get("DRIVER_PROVIDER", "openai-codex")
+GUEST = os.environ.get("HERMES_MEET_GUEST_NAME", "Verter Multitender")
+
+# Loop cadence: how often we poll status()/transcript(). 2.5s balances
+# responsiveness vs. status() churn; below ~1s adds load with no perceptible gain.
+POLL_SEC = _envf("DRIVER_POLL_SEC", 2.5, 0.5, 30)
+MAX_CTX_LINES = _envi("DRIVER_MAX_CTX_LINES", 24, 4, 200)  # dialogue lines → LLM
+
+# Address fuzzy-match ratio: a word must START like the name (вер/вэр/вёр) AND
+# score >= this vs. "вертер". 0.8 catches ASR manglings (вертел/вертера) while
+# weather words (ветер/ветра, prefix вет-) are excluded by the prefix guard. The
+# strict LLM prompt is the SECOND filter. NB: this is NOT REPLY_DEDUP_RATIO —
+# older comments drifted and conflated the two (0.8 here vs 0.72 there).
+ADDRESS_FUZZY_RATIO = _envf("DRIVER_ADDRESS_FUZZY_RATIO", 0.8, 0.5, 1.0)
+
+# End-of-meeting from the DIALOGUE (not the fragile DOM participantCount, which
+# returned None in the field): after a farewell, leave once humans go quiet for
+# END_GRACE; backstop — leave after MAX_IDLE of NO human speech at all (0
+# disables). Independent of _detect_alone/participantCount.
+END_GRACE = _envf("DRIVER_END_GRACE", 25, 0, 600)
+MAX_IDLE = _envf("DRIVER_MAX_IDLE", 300, 0, 3600)
+
+# Reply-dedup: don't re-voice a reply too similar to a recent one — stops
+# "да, я на связи" cycling when the user re-asks. RATIO = similarity threshold;
+# WINDOW = lookback seconds (B3 narrows the policy to the last few replies).
+REPLY_DEDUP_RATIO = _envf("DRIVER_REPLY_DEDUP_RATIO", 0.72, 0.5, 1.0)
+REPLY_DEDUP_WINDOW = _envf("DRIVER_REPLY_DEDUP_WINDOW", 90, 0, 3600)
+
+# Heavy background task: timeout for the tool-capable agent + max concurrent.
+HEAVY_TIMEOUT = _envf("DRIVER_HEAVY_TIMEOUT", 900, 30, 3600)
+MAX_HEAVY = _envi("DRIVER_MAX_HEAVY", 1, 1, 8)
+# PATH for the background tool-capable agent (hermes CLI + nvm node for codex).
+_HERMES_BIN = os.environ.get(
+    "DRIVER_HERMES_BIN",
+    "/home/vitaly/.local/bin:/home/vitaly/.nvm/versions/node/v24.13.1/bin")
+
+
 # Address detection: the bot responds only when called by name. Russian ASR
-# routinely mangles "Вертер" (heard "ветра", "ветер", "вертел"…), so we fuzzy-match
-# each word against "вертер" (ratio>=0.72 catches those manglings; common words
-# score <=0.55). The strict LLM prompt is the second filter — if a near-miss like
-# "ветер" (wind) wasn't really an address, the model returns SKIP. Greeting on
-# join and goodbye on close are the only unprompted lines.
+# routinely mangles "Вертер" (heard "ветра", "ветер", "вертел"…), so we fuzzy-
+# match each word against "вертер". The strict LLM prompt is the second filter —
+# if a near-miss like "ветер" (wind) wasn't really an address, the model returns
+# SKIP. Greeting on join and goodbye on close are the only unprompted lines.
 def _addressed(text: str) -> bool:
     t = (text or "").lower()
     if "verter" in t or "вертер" in t or "вэртер" in t:
         return True
     for w in re.findall(r"[а-яёa-z]{5,9}", t):
         # Must START like the name (вер/вэр/вёр). Weather words "ветер"/"ветра"
-        # begin with "вет-" and otherwise fuzzy-matched at ~0.9, making the bot
-        # barge in (review blocker). Clean "вертер"/"verter" already caught above.
+        # begin with "вет-" and would otherwise fuzzy-match high. Clean
+        # "вертер"/"verter" already caught above.
         if w[:3] in ("вер", "вэр", "вёр") and \
-                difflib.SequenceMatcher(None, w, "вертер").ratio() >= 0.8:
+                difflib.SequenceMatcher(None, w, "вертер").ratio() >= ADDRESS_FUZZY_RATIO:
             return True
     return False
-
-MODEL = os.environ.get("DRIVER_MODEL", "gpt-5.5")
-PROVIDER = os.environ.get("DRIVER_PROVIDER", "openai-codex")
-GUEST = os.environ.get("HERMES_MEET_GUEST_NAME", "Verter Multitender")
-POLL_SEC = float(os.environ.get("DRIVER_POLL_SEC", "2.5"))
-MAX_CTX_LINES = 24            # rolling dialogue context fed to the LLM
-# End-of-meeting (presence from the DIALOGUE, not the fragile DOM participant
-# count which returned None in the field): after a farewell, leave once the
-# humans go quiet for END_GRACE; as a backstop, leave after MAX_IDLE of NO human
-# speech at all (0 disables). This is what makes the bot actually leave when
-# everyone said bye and dropped — independent of _detect_alone/participantCount.
-END_GRACE = float(os.environ.get("DRIVER_END_GRACE", "25"))
-MAX_IDLE = float(os.environ.get("DRIVER_MAX_IDLE", "300"))
-# Reply-dedup: don't re-voice a reply that's similar to ANY of the last few
-# (not just the last one) within a window — stops "да, я на связи" cycling when
-# the user re-asks similar things. Lower ratio + longer window than before.
-REPLY_DEDUP_RATIO = float(os.environ.get("DRIVER_REPLY_DEDUP_RATIO", "0.72"))
-REPLY_DEDUP_WINDOW = float(os.environ.get("DRIVER_REPLY_DEDUP_WINDOW", "90"))
-HEAVY_TIMEOUT = float(os.environ.get("DRIVER_HEAVY_TIMEOUT", "900"))
-MAX_HEAVY = int(os.environ.get("DRIVER_MAX_HEAVY", "1"))  # concurrent bg agents
-# PATH for the background tool-capable agent (hermes CLI + nvm node for codex).
-_HERMES_BIN = os.environ.get(
-    "DRIVER_HERMES_BIN",
-    "/home/vitaly/.local/bin:/home/vitaly/.nvm/versions/node/v24.13.1/bin")
 
 # Background-task throttle: ONE tool-capable agent at a time + dedup of
 # near-identical tasks, so a topic discussed repeatedly (with the bot named) does

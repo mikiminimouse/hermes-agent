@@ -94,8 +94,9 @@ def _meeting_id_from_url(url: str) -> str:
 _CAPTION_PUNCT_RE = re.compile(r"[^\w\s]", flags=re.UNICODE)
 _CAPTION_WS_RE = re.compile(r"\s+")
 # Seconds a speaker's caption can stay unchanged before we finalize the utterance
-# (Vexa idle-finalization; Meet has no is_final flag). Overridable for tests.
-_CAPTION_FINALIZE_PAUSE = 2.0
+# (Vexa idle-finalization; Meet has no is_final flag). ~2s ≈ a natural human
+# pause between turns. Env-overridable for live tuning; tests also patch it.
+_CAPTION_FINALIZE_PAUSE = float(os.environ.get("HERMES_MEET_FINALIZE_PAUSE", "2.0"))
 
 
 def _caption_norm_words(text: str) -> list[str]:
