@@ -252,6 +252,47 @@ def _clean_transcript_text(meeting_dir: Path) -> str:
     return "\n".join(lines)
 
 
+_ACTION_RE = re.compile(
+    r"\b(надо|нужно|задач|проверь|проверить|сделать|сделай|подключ|настро|"
+    r"исправ|добав|подготов|запиш|разобрать|выясни|todo|fix|check)\b", re.IGNORECASE)
+
+
+def _extractive_report(meeting_id: str, transcript_text: str, reason: str) -> str:
+    """LLM-free fallback report so a meeting is NEVER lost when codex is down
+    (e.g. 429 usage_limit). Pure extraction from the deduplicated transcript:
+    participants, heuristic action-ish lines, and the full turn list. Lower
+    quality than the codex summary, but complete and instant — the user can
+    regenerate a rich report by re-running summarization once quota resets."""
+    lines = [l.strip() for l in transcript_text.splitlines() if l.strip()]
+    speakers: list = []
+    for l in lines:
+        if ":" in l:
+            sp = l.split(":", 1)[0].strip()
+            if sp and sp.lower() != "you" and sp not in speakers:
+                speakers.append(sp)
+    actions = [l for l in lines if _ACTION_RE.search(l)][:25]
+    m = re.search(r"resets_in_seconds['\"]?\s*[:=]\s*(\d+)", reason)
+    reset_note = (f" Квота восстановится примерно через {int(int(m.group(1)) / 60)} мин — "
+                  "тогда можно перегенерировать полноценный отчёт.") if m else ""
+    md = [
+        f"# Итоги встречи — {meeting_id}",
+        "",
+        f"> ⚠️ Экстрактивный фолбэк БЕЗ LLM: авто-суммаризатор (codex) недоступен "
+        f"({reason[:160]}).{reset_note} Ниже — извлечение из транскрипта; для "
+        "связного отчёта перезапусти суммаризацию позже.",
+        "",
+        f"**Участники:** {', '.join(speakers) if speakers else 'не определены'}",
+        "",
+        "## Возможные задачи / действия (эвристика по ключевым словам)",
+    ]
+    md += [f"- {l}" for l in actions] or ["- (явных задач не выделено)"]
+    md += ["", "## Реплики встречи (дедуплицированные)"]
+    md += [f"- {l}" for l in lines[:500]]
+    if len(lines) > 500:
+        md.append(f"- … ещё {len(lines) - 500} реплик (см. transcript_clean.jsonl)")
+    return "\n".join(md) + "\n"
+
+
 def summarize(meeting_dir: Path) -> int:
     transcript = meeting_dir / "transcript.txt"
     report = meeting_dir / "report.md"
@@ -317,14 +358,31 @@ def summarize(meeting_dir: Path) -> int:
         return 1
 
     if proc.returncode != 0 or not report.is_file() or not report.read_text().strip():
-        _update_marker(
-            marker, status="failed",
-            error=f"codex rc={proc.returncode}: {(proc.stderr or '')[:500]}",
-            endedAt=time.time(),
-        )
-        print(f"[meet_summarize] codex failed rc={proc.returncode}\n{proc.stderr}",
-              file=sys.stderr)
-        return 1
+        cerr = ((proc.stderr or "") + "\n" + (proc.stdout or "")).strip()
+        rate_limited = bool(re.search(
+            r"usage_limit|rate.?limit|\b429\b|too many requests", cerr, re.IGNORECASE))
+        # FALLBACK: never lose the meeting — write an extractive (LLM-free) report.
+        try:
+            report.write_text(_extractive_report(meeting_id, transcript_text, cerr[:300]),
+                              encoding="utf-8")
+            _update_marker(
+                marker, status="done_extractive", reportPath=str(report),
+                summarizedAt=time.time(),
+                error=f"codex rc={proc.returncode} "
+                      f"({'rate_limit' if rate_limited else 'error'}); extractive fallback",
+            )
+            print(f"[meet_summarize] codex failed rc={proc.returncode} "
+                  f"({'rate-limit' if rate_limited else 'error'}); wrote EXTRACTIVE "
+                  f"fallback to {report}", file=sys.stderr)
+            return 0
+        except Exception as e:
+            _update_marker(
+                marker, status="failed",
+                error=f"codex rc={proc.returncode}; fallback failed: {e}",
+                endedAt=time.time())
+            print(f"[meet_summarize] codex failed AND fallback failed: {e}",
+                  file=sys.stderr)
+            return 1
 
     _update_marker(marker, status="done", reportPath=str(report), summarizedAt=time.time())
     print(f"[meet_summarize] wrote {report}")

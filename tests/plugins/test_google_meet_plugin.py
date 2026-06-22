@@ -442,6 +442,25 @@ def test_collapse_transcript_empty_and_noise():
     assert collapse_transcript("garbage line with no timestamp") == ""
 
 
+def test_extractive_fallback_report():
+    """LLM-free fallback (codex rate-limited): a complete report is still produced."""
+    from plugins.google_meet.meet_summarize import _extractive_report
+
+    tx = "\n".join([
+        "Виталий Бычков: Вертер проверь плагин",
+        "Сергей Пак: нужно подготовить презентацию",
+        "You: да слышу",                       # bot echo — excluded from participants
+        "Виталий Бычков: просто болтаем",
+    ])
+    r = _extractive_report("tio-tdwx-dse", tx, "codex rc=1: usage_limit_reached resets_in_seconds: 4787")
+    assert "tio-tdwx-dse" in r
+    assert "Виталий Бычков" in r and "Сергей Пак" in r
+    assert "You" not in r.split("**Участники:**", 1)[1].split("\n", 1)[0]  # echo not a participant
+    assert "проверь" in r and "подготовить" in r          # action heuristic caught them
+    assert "мин" in r                                       # reset-time note from resets_in_seconds
+    assert "болтаем" in r                                   # full turn list present
+
+
 def test_parse_duration():
     from plugins.google_meet.meet_bot import _parse_duration
 
