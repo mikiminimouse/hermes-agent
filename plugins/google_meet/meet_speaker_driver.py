@@ -94,11 +94,14 @@ ADDRESS_FUZZY_RATIO = _envf("DRIVER_ADDRESS_FUZZY_RATIO", 0.8, 0.5, 1.0)
 END_GRACE = _envf("DRIVER_END_GRACE", 25, 0, 600)
 MAX_IDLE = _envf("DRIVER_MAX_IDLE", 300, 0, 3600)
 
-# Reply-dedup: don't re-voice a reply too similar to a recent one — stops
-# "да, я на связи" cycling when the user re-asks. RATIO = similarity threshold;
-# WINDOW = lookback seconds (B3 narrows the policy to the last few replies).
+# Reply-dedup: suppress a reply only if it's too similar to one of the LAST FEW
+# replies (not a time window). RATIO = similarity threshold; KEEP = how many
+# recent replies to compare against. A time window silently swallowed a genuine
+# re-ask ("Вертер, так что по задаче?") if a similar line was voiced ~1 min ago
+# → the bot looked deaf. Checking only the last KEEP replies means a re-ask after
+# KEEP other turns is treated as fresh and gets answered.
 REPLY_DEDUP_RATIO = _envf("DRIVER_REPLY_DEDUP_RATIO", 0.72, 0.5, 1.0)
-REPLY_DEDUP_WINDOW = _envf("DRIVER_REPLY_DEDUP_WINDOW", 90, 0, 3600)
+REPLY_DEDUP_KEEP = _envi("DRIVER_REPLY_DEDUP_KEEP", 3, 1, 20)
 
 # Heavy background task: timeout for the tool-capable agent + max concurrent.
 HEAVY_TIMEOUT = _envf("DRIVER_HEAVY_TIMEOUT", 900, 30, 3600)
@@ -181,8 +184,10 @@ _SYS = (
     "- К тебе обратились с обычным вопросом/репликой → дай короткий живой устный "
     "ответ.\n"
     "Никогда не описывай свои действия и НЕ оправдывайся (не говори «я молчал, "
-    "потому что…», «не поздоровался, потому что…») — просто отвечай по сути, "
-    "по-разному, не повторяй одну и ту же фразу."
+    "потому что…», «не поздоровался, потому что…») — просто отвечай по сути.\n"
+    "НЕ ПОВТОРЯЙСЯ: не повторяй ни ту же фразу, ни тот же СМЫСЛ, что уже говорил "
+    "недавно. Если тебя переспрашивают об одном и том же — ответь короче и иначе "
+    "или добавь новое, но не зачитывай прежний ответ заново."
 )
 
 
@@ -341,7 +346,7 @@ def main(argv) -> int:
     convo: list = []          # rolling "Speaker: text" of the whole dialogue
     addressed = False         # bot was explicitly addressed in the new lines
     farewelled = False        # we've already said our goodbye
-    recent_replies: list = []   # [(norm, at)] for reply-dedup across last few
+    recent_replies: list = []   # norms of the last REPLY_DEDUP_KEEP replies
     last_human_at = time.time()   # presence signal: when a human last spoke
     had_human = False
     while True:
@@ -404,19 +409,18 @@ def main(argv) -> int:
                 _say(msg)
                 _log(out_dir, f"delegate→ {msg[:32]} | {task[:60]}")
             else:
-                # Reply-dedup across the last few replies (not just the last) so
-                # an A/B/A/B cycle of near-identical answers can't slip through.
-                now2 = time.time()
+                # Reply-dedup against ONLY the last REPLY_DEDUP_KEEP replies (not
+                # a time window) so a back-to-back A/B/A repeat is caught but a
+                # genuine re-ask after a few turns is treated as fresh.
                 rnorm = _norm_task(reply)
-                recent_replies = [(t, a) for (t, a) in recent_replies
-                                  if now2 - a < REPLY_DEDUP_WINDOW]
                 dup = any(difflib.SequenceMatcher(None, rnorm, t).ratio() >= REPLY_DEDUP_RATIO
-                          for (t, a) in recent_replies)
+                          for t in recent_replies)
                 if dup:
                     _log(out_dir, "skip dup reply")
                 else:
                     _say(reply)
-                    recent_replies.append((rnorm, now2))
+                    recent_replies.append(rnorm)
+                    del recent_replies[:-REPLY_DEDUP_KEEP]
                     _log(out_dir, f"said: {reply[:80]}")
 
         # End the meeting from the DIALOGUE (no reliance on participantCount):
