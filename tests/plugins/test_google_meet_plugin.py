@@ -1482,8 +1482,11 @@ def test_detect_admission_drops_dead_jsname_and_adds_ru():
 
     src = inspect.getsource(_detect_admission)
     assert "call_end" in src             # locale-independent hangup ligature
-    assert "убтитр" in src               # RU caption region aria stem
     assert 'jsname="YSxPC"' not in src   # dead legacy selector removed
+    # The caption-region signal was REMOVED (it false-positived in the lobby,
+    # where the observer + caption container already exist). Admission now relies
+    # on a pre-join guard + the in-call-only leave button / participants panel.
+    assert "ask to join" in src.lower() and "присоедин" in src  # pre-join guard
 
 
 def test_detect_admission_has_lobby_guard():
