@@ -122,11 +122,27 @@ def start(
     out = out_dir or (_root() / meeting_id)
     out.mkdir(parents=True, exist_ok=True)
 
-    # Wipe any stale transcript/status files from a previous run of this
-    # meeting id so polling isn't confused.
-    for name in ("transcript.txt", "status.json", "transcript_clean.jsonl",
-                 "say_queue.jsonl", "summary_request.json", "report.md",
-                 "admission_debug.json", "meeting_closing.json"):
+    # Start clean for a fresh run, but NEVER destroy a prior meeting's content:
+    # ARCHIVE the valuable artifacts (transcript + report) into out/archive/ with
+    # a timestamp, and only delete the ephemeral state files. This protects
+    # against an accidental relaunch on the same meeting id wiping a real
+    # transcript (it bit us during debugging — repeated launches on one URL).
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    archive_targets = ("transcript.txt", "transcript_clean.jsonl", "report.md")
+    transient = ("status.json", "say_queue.jsonl", "summary_request.json",
+                 "admission_debug.json", "meeting_closing.json", "caption_dom.json")
+    for name in archive_targets:
+        f = out / name
+        try:
+            if f.is_file() and f.stat().st_size > 0:
+                arch = out / "archive"
+                arch.mkdir(exist_ok=True)
+                f.rename(arch / f"{name}.{ts}")
+            elif f.exists():
+                f.unlink()
+        except OSError:
+            pass
+    for name in transient:
         f = out / name
         if f.exists():
             try:
