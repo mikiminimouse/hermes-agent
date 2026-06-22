@@ -421,16 +421,34 @@ _CAPTION_OBSERVER_JS = r"""
   function scan() {
     const root = document.querySelector(captionSelector);
     if (!root) return;
-    // Each caption row carries a speaker label then the spoken text. Old class
-    // selectors drift across Meet rewrites, so split the row/region innerText:
-    // line 1 = speaker, the rest = text. Falls back to the whole region.
-    const rows = root.querySelectorAll('div[jsname="dsyhDe"]');
+    // PER-SPEAKER rows. CRITICAL: the region node itself carries
+    // jsname="dsyhDe", so the old `querySelectorAll('div[jsname="dsyhDe"]')`
+    // matched the WHOLE region as one "row" and collapsed every speaker into a
+    // single blob (verified via caption_dom dump, 2026-06-22). The real rows are
+    // `.nMcdL` (one per speaker turn) with the speaker name in `.KcIKyf`. Class
+    // names drift across Meet rewrites, so we try rows first, then structural
+    // children, then fall back to the whole-region line split.
+    let rows = root.querySelectorAll('.nMcdL');
+    if (!rows.length) rows = root.querySelectorAll(':scope > div > div');
     const targets = (rows && rows.length) ? rows : [root];
     targets.forEach((row) => {
+      // Speaker name is its own node (class drifts → try a few); strip it from
+      // the row text to get the spoken words.
+      let speaker = '';
+      const sp = row.querySelector('.KcIKyf, .zs7s8d, [data-self-name]');
+      if (sp) speaker = (sp.innerText || '').trim();
       const lines = (row.innerText || '').split('\n').map((s) => s.trim()).filter(Boolean);
       if (!lines.length) return;
-      if (lines.length === 1) pushEntry('', lines[0]);
-      else pushEntry(lines[0], lines.slice(1).join(' '));
+      if (speaker) {
+        // Drop the leading speaker-name line(s), keep the rest as text.
+        let rest = lines.filter((l) => l !== speaker);
+        const text = rest.join(' ').trim();
+        if (text) pushEntry(speaker, text);
+      } else if (lines.length === 1) {
+        pushEntry('', lines[0]);
+      } else {
+        pushEntry(lines[0], lines.slice(1).join(' '));
+      }
     });
   }
 
