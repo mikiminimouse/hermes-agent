@@ -1147,6 +1147,9 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
             alone_since: Optional[float] = None
             last_alone_check = 0.0
             last_participant_check = 0.0
+            last_dom_dump = 0.0
+            dump_caption_dom = os.environ.get(
+                "HERMES_MEET_DUMP_CAPTION_DOM", "").lower() in ("1", "true", "yes")
             while not stop_flag["stop"]:
                 now = time.time()
                 if deadline and now > deadline:
@@ -1318,6 +1321,12 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
                     pc = _get_participant_count(page)
                     if pc is not None and pc != state.participant_count:
                         state.set(participant_count=pc)
+
+                # Diagnostic caption-DOM dump (env-gated) for fixing the
+                # per-speaker row selector when Meet's DOM drifts.
+                if dump_caption_dom and state.in_call and (now - last_dom_dump) > 5.0:
+                    last_dom_dump = now
+                    _dump_caption_dom(page, out_dir)
 
                 # Close out any utterance that has paused, so the clean
                 # transcript (transcript_clean.jsonl) tracks the live dialogue.
@@ -1678,6 +1687,53 @@ def _get_participant_count(page) -> Optional[int]:
         return int(v) if isinstance(v, (int, float)) and v > 0 else None
     except Exception:
         return None
+
+
+def _dump_caption_dom(page, out_dir) -> None:
+    """Diagnostic (env-gated by HERMES_MEET_DUMP_CAPTION_DOM): write the live
+    caption container's structure to caption_dom.json so we can engineer the
+    per-speaker row selector when Meet's DOM drifts. Captures the region's
+    outerHTML plus, for several candidate selectors, the match count and sample
+    innerText of each node — enough to see how speakers are nested. Overwrites
+    each call (latest snapshot). Never raises (diagnostics must not break join)."""
+    probe = r"""
+    (() => {
+      const out = { candidates: [], region: null };
+      const sels = [
+        '[role="region"][aria-label*="aption" i]',
+        'div[jsname="dsyhDe"]',
+        '[data-self-name]',
+        '[class*="caption" i]',
+        '.bYevke', '.nMcdL', '.KcIKyf', '.zs7s8d',  // historical row/speaker classes
+      ];
+      for (const sel of sels) {
+        let nodes = [];
+        try { nodes = [...document.querySelectorAll(sel)]; } catch (e) { continue; }
+        out.candidates.push({
+          sel,
+          count: nodes.length,
+          samples: nodes.slice(0, 6).map((n) => ({
+            tag: n.tagName,
+            jsname: n.getAttribute('jsname') || '',
+            cls: (n.className || '').toString().slice(0, 80),
+            text: (n.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 160),
+            childDivs: n.querySelectorAll('div').length,
+          })),
+        });
+      }
+      const region = document.querySelector('[role="region"][aria-label*="aption" i]')
+                  || document.querySelector('div[jsname="dsyhDe"]');
+      if (region) out.region = (region.outerHTML || '').slice(0, 24000);
+      return out;
+    })();
+    """
+    try:
+        import json as _json
+        snap = page.evaluate(probe)
+        (out_dir / "caption_dom.json").write_text(
+            _json.dumps(snap, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
 
 
 def _detect_denied(page) -> bool:
