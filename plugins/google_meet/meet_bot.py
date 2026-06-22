@@ -1724,7 +1724,11 @@ def _detect_admission(page) -> bool:
       // device-preview/lobby page, NOT admitted. The caption container + observer
       // can already exist here, which falsely tripped the old caption-region
       // check and latched in_call=True while still in the lobby.
+      const vis = (b) => !!(b.offsetWidth || b.offsetHeight || b.getClientRects().length);
       const joinBtn = buttons.find((b) => {
+        if (!vis(b)) return false;   // Meet keeps a HIDDEN "Ask to join" in the
+                                     // DOM after admission — only a VISIBLE one
+                                     // means we're really on the pre-join screen.
         const t = `${b.innerText || ''} ${b.getAttribute('aria-label') || ''}`.toLowerCase();
         return /join now|ask to join|switch here|присоедин|попросить присоедин/.test(t);
       });
