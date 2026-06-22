@@ -243,6 +243,45 @@ def test_dialogue_end_reason(tmp_path):
     assert s.dialogue_end_reason(t0 + _MAX_IDLE + 1) is None
 
 
+def test_finalized_tracker_dedup():
+    # К1: all finalize-suppression logic in one tested place.
+    from plugins.google_meet.meet_bot import _FinalizedTracker
+
+    t = _FinalizedTracker()
+    # First emit of a turn → not suppressed.
+    assert t.suppress("привет мир") is False
+    t.add("привет мир", 0, "привет мир")
+    # Exact scroll re-render → suppressed.
+    assert t.suppress("привет мир") is True
+    # A fragment of a recent turn → suppressed.
+    assert t.suppress("привет") is True
+    # A superset (late refinement) → not a plain dup; refine_target points at it.
+    assert t.suppress("привет мир как дела") is False
+    target = t.refine_target("привет мир как дела")
+    assert target is not None and target["id"] == 0
+    # A genuinely new turn → neither suppressed nor a refinement.
+    assert t.suppress("совсем другая реплика") is False
+    assert t.refine_target("совсем другая реплика") is None
+
+
+def test_scroll_rerender_emits_no_duplicate(tmp_path):
+    import time
+    from plugins.google_meet.meet_bot import _BotState, _CAPTION_FINALIZE_PAUSE
+
+    out = tmp_path / "s"
+    state = _BotState(out_dir=out, meeting_id="x-y-z",
+                      url="https://meet.google.com/x-y-z")
+    # Alice speaks; caption goes idle → finalized once.
+    state.record_caption("Alice", "привет мир")
+    state.tick_finalize(now=time.time() + _CAPTION_FINALIZE_PAUSE + 1)
+    assert len(_clean_entries(out)) == 1
+    # Meet scrolls the window and re-renders the SAME old turn later → suppressed,
+    # no second clean line (the "looping" root cause).
+    state.record_caption("Alice", "привет мир")
+    state.tick_finalize(now=time.time() + _CAPTION_FINALIZE_PAUSE + 1)
+    assert len(_clean_entries(out)) == 1
+
+
 def test_transcript_reader_exposes_clean_lines(tmp_path):
     from plugins.google_meet import process_manager as pm
 

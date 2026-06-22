@@ -167,6 +167,56 @@ def _is_farewell_candidate(text: str) -> bool:
     return bool(_FAREWELL_RE.search(_norm_caption(text)))
 
 
+class _FinalizedTracker:
+    """Per-speaker dedup of FINALIZED utterances (К1: ONE place for all the
+    finalize-suppression logic that used to be split across ``_seen_final`` and
+    ``_recent_final``).
+
+    Google Meet has no utterance id / is_final flag and scrolls its 2-line
+    caption window, re-rendering OLD already-closed turns far beyond the recent
+    window; without dedup a 9-min call emitted 10609 lines for 235 unique turns.
+    Two complementary checks:
+      * exact set of every norm ever emitted → O(1) guard for far-back scroll
+        re-renders (bounded so a multi-hour call can't grow it without bound);
+      * a short recent list → substring folding (a fragment of a recent turn is
+        dropped; a superset that extends a recent turn is a late refinement).
+    """
+
+    _SEEN_CAP = 3000   # exact-match memory for far-back scroll re-renders
+    _RECENT = 8        # window for fragment / refinement (substring) folding
+
+    def __init__(self) -> None:
+        self._seen: set = set()      # every norm ever emitted (exact match)
+        self._recent: list = []      # [{"norm","id","text"}], newest last
+
+    def suppress(self, norm: str) -> bool:
+        """True if this finalized norm must NOT be emitted: an exact re-render,
+        or a fragment of a still-recent turn."""
+        if norm in self._seen:
+            return True
+        return any(norm and norm in r["norm"] for r in self._recent)
+
+    def refine_target(self, norm: str) -> Optional[dict]:
+        """If *norm* is a late extension (superset) of a recent finalized turn,
+        return that record so the caller can update it in place; else None."""
+        for r in self._recent:
+            if r["norm"] and r["norm"] in norm:
+                return r
+        return None
+
+    def add(self, norm: str, entry_id: int, text: str) -> None:
+        self._seen.add(norm)
+        if len(self._seen) > self._SEEN_CAP:
+            self._seen.clear()
+        self._recent.append({"norm": norm, "id": entry_id, "text": text})
+        del self._recent[:-self._RECENT]
+
+    def update(self, rec: dict, norm: str, text: str) -> None:
+        """Record an in-place refinement of an already-emitted turn."""
+        rec["norm"], rec["text"] = norm, text
+        self._seen.add(norm)
+
+
 class _BotState:
     """Single-process mutable state, flushed to ``status.json`` on each change."""
 
@@ -203,14 +253,10 @@ class _BotState:
         # Folds growing/refining caption snapshots into one utterance; finalized
         # utterances are appended (clean) to transcript_clean.jsonl.
         self._live: dict = {}
-        # Dedup of finalized utterances. `_seen_final` is the set of ALL
-        # normalized turns ever emitted per speaker → O(1) exact-match guard that
-        # kills re-finalization when Meet scrolls its 2-line caption window and
-        # re-renders an OLD row (a 9-min call made 10609 lines for 235 uniques
-        # with the previous last-6 window). `_recent_final` (last few) additionally
-        # catches partial fragments of a still-recent turn.
-        self._seen_final: dict = {}
-        self._recent_final: dict = {}
+        # Dedup of finalized utterances — ONE tracker per speaker (К1). See
+        # _FinalizedTracker for the exact-set + recent-substring scheme that kills
+        # scroll re-renders, fragments, and folds late refinements.
+        self._dedup: dict = {}   # speaker -> _FinalizedTracker
         out_dir.mkdir(parents=True, exist_ok=True)
         self.transcript_path = out_dir / "transcript.txt"
         self.clean_path = out_dir / "transcript_clean.jsonl"
@@ -318,31 +364,21 @@ class _BotState:
             return
         text = buf["text"].strip()
         norm = buf.get("norm") or _norm_caption(text)
-        recent = self._recent_final.get(speaker, [])
-        seen = self._seen_final.setdefault(speaker, set())
-        # ROOT FIX for re-finalization: Meet scrolls its 2-line caption window
-        # and re-renders OLD already-closed turns far beyond the recent window —
-        # e.g. an old "Вертер, слышишь?" scrolls back into view and gets
-        # finalized again with a new id, which then re-triggers the driver's
-        # address-gate and makes the bot re-answer ("looping"). Suppress against
-        # the set of ALL turns ever emitted for this speaker, not just the last
-        # few. (A 9-min call produced 10609 lines for 235 uniques otherwise.)
-        if norm in seen:
+        ded = self._dedup.setdefault(speaker, _FinalizedTracker())
+        # Scroll re-render of an OLD closed turn, or a fragment of a recent one →
+        # drop. (An old "Вертер, слышишь?" scrolling back into view would else be
+        # re-finalized with a new id and re-trigger the driver's address-gate.)
+        if ded.suppress(norm):
             return
-        for r in recent:
-            r_norm = r.get("norm", "") if isinstance(r, dict) else str(r)
-            r_id = r.get("id") if isinstance(r, dict) else None
-            if norm and norm in r_norm:
-                return  # a fragment of a still-recent turn
-            if r_norm and r_norm in norm:
-                # A late Meet refinement extended an utterance we already
-                # finalized. Update that JSONL entry in place (same id/cursor)
-                # instead of emitting a duplicate clean turn.
-                if isinstance(r_id, int) and self._rewrite_clean_entry(r_id, text):
-                    r["norm"] = norm
-                    r["text"] = text
-                    seen.add(norm)
+        target = ded.refine_target(norm)
+        if target is not None:
+            # A late Meet refinement extended a turn we already finalized. Update
+            # that JSONL entry in place (same id/cursor) instead of emitting a
+            # duplicate clean turn. (File is small at call scale — see К1 note.)
+            if isinstance(target.get("id"), int) and self._rewrite_clean_entry(target["id"], text):
+                ded.update(target, norm, text)
                 return
+            # rewrite failed → fall through and emit as a fresh turn
         entry = {
             "id": self._finalize_counter,
             "ts": time.strftime("%H:%M:%S", time.localtime(buf["started"])),
@@ -350,14 +386,7 @@ class _BotState:
             "text": text,
         }
         self._finalize_counter += 1
-        # Remember this finalized turn: full set for exact-match (scroll re-render)
-        # + a short recent list for prefix/fragment folding. Cap the set so a
-        # multi-hour call can't grow it without bound.
-        seen.add(norm)
-        if len(seen) > 3000:
-            seen.clear()
-        recent.append({"norm": norm, "id": entry["id"], "text": text})
-        self._recent_final[speaker] = recent[-8:]
+        ded.add(norm, entry["id"], text)
         is_human = _looks_like_human_speaker(speaker, getattr(self, "guest_name", ""))
         # Track human speakers for greeting / presence (best-effort; the People
         # panel is unreliable, but whoever actually spoke is a real participant).
