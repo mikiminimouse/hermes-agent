@@ -1297,6 +1297,12 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
                 if not state.in_call and (now - last_admission_check) > 3.0:
                     last_admission_check = now
                     admitted = _detect_admission(page)
+                    if not admitted:
+                        # Re-click a still-visible "Join now"/"Ask to join": the
+                        # first click can land before the button renders or not
+                        # take at all, and the bot would otherwise sit at the
+                        # pre-join screen forever (seen in the field).
+                        _click_join(page, state)
                     if admitted:
                         state.set(
                             in_call=True,
