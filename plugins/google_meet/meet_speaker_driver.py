@@ -64,6 +64,13 @@ PROVIDER = os.environ.get("DRIVER_PROVIDER", "openai-codex")
 GUEST = os.environ.get("HERMES_MEET_GUEST_NAME", "Verter Multitender")
 POLL_SEC = float(os.environ.get("DRIVER_POLL_SEC", "2.5"))
 MAX_CTX_LINES = 24            # rolling dialogue context fed to the LLM
+# End-of-meeting (presence from the DIALOGUE, not the fragile DOM participant
+# count which returned None in the field): after a farewell, leave once the
+# humans go quiet for END_GRACE; as a backstop, leave after MAX_IDLE of NO human
+# speech at all (0 disables). This is what makes the bot actually leave when
+# everyone said bye and dropped — independent of _detect_alone/participantCount.
+END_GRACE = float(os.environ.get("DRIVER_END_GRACE", "25"))
+MAX_IDLE = float(os.environ.get("DRIVER_MAX_IDLE", "300"))
 HEAVY_TIMEOUT = float(os.environ.get("DRIVER_HEAVY_TIMEOUT", "900"))
 MAX_HEAVY = int(os.environ.get("DRIVER_MAX_HEAVY", "1"))  # concurrent bg agents
 # PATH for the background tool-capable agent (hermes CLI + nvm node for codex).
@@ -273,6 +280,8 @@ def main(argv) -> int:
     addressed = False         # bot was explicitly addressed in the new lines
     farewelled = False        # we've already said our goodbye
     last_reply = {"text": "", "at": 0.0}   # for reply-dedup (don't repeat verbatim)
+    last_human_at = time.time()   # presence signal: when a human last spoke
+    had_human = False
     while True:
         st = pm.status()
         if st.get("exited") or st.get("leaveReason"):
@@ -290,6 +299,8 @@ def main(argv) -> int:
             if _is_self(speaker):
                 continue          # ignore our own TTS echo
             convo.append(line)
+            last_human_at = time.time()   # a human just spoke → presence
+            had_human = True
             if _addressed(text):          # bot called by name (ASR-fuzzy)
                 addressed = True
             if _is_farewell_candidate(text):
@@ -341,6 +352,17 @@ def main(argv) -> int:
                     _say(reply)
                     last_reply = {"text": reply, "at": now2}
                     _log(out_dir, f"said: {reply[:80]}")
+
+        # End the meeting from the DIALOGUE (no reliance on participantCount):
+        # a farewell happened and the humans have gone quiet, or nobody has
+        # spoken for a long time at all.
+        idle = time.time() - last_human_at
+        if farewelled and idle > END_GRACE:
+            _log(out_dir, f"end: farewell + {int(idle)}s silence → leaving")
+            break
+        if MAX_IDLE > 0 and had_human and idle > MAX_IDLE:
+            _log(out_dir, f"end: {int(idle)}s no human speech → leaving")
+            break
 
         time.sleep(POLL_SEC)
 
