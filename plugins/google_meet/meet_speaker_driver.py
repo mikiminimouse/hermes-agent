@@ -252,16 +252,29 @@ def main(argv) -> int:
         return 1
     _log(out_dir, f"driver up: model={MODEL} url={url}")
 
-    # 1) Wait for realtime readiness (max ~90s).
-    deadline = time.time() + 90
-    while time.time() < deadline:
+    # 1) Wait until ADMITTED (realtimeReady AND inCall). Do NOT greet into the
+    # lobby: if the host never admits, the bot lobby-times-out and we just exit
+    # cleanly — greeting an un-admitted bot only voiced into the void.
+    admit_wait = float(os.environ.get("DRIVER_ADMIT_WAIT", "330"))
+    admit_deadline = time.time() + admit_wait
+    admitted = False
+    while time.time() < admit_deadline:
         st = pm.status()
         if st.get("realtimeReady") and st.get("inCall"):
+            admitted = True
             break
-        if st.get("exited"):
-            _log(out_dir, "bot exited before ready")
+        if st.get("exited") or st.get("leaveReason"):
+            _log(out_dir, f"bot ended before admission: {st.get('leaveReason')}")
             return 1
         time.sleep(2)
+    if not admitted:
+        _log(out_dir, "not admitted within wait window — leaving without greeting")
+        try:
+            if pm.status().get("alive"):
+                pm.stop(reason="not admitted")
+        except Exception:
+            pass
+        return 1
 
     # 2) Greet — and VERIFY it was actually voiced. Even with the Silero warm-up
     # in connect(), the audio pipeline (pump/sink) can need a moment, so retry up
