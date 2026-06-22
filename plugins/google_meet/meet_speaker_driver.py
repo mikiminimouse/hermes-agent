@@ -23,6 +23,7 @@ Model via env DRIVER_MODEL / DRIVER_PROVIDER (default gpt-5.5 / openai-codex).
 from __future__ import annotations
 
 import os
+import re
 import sys
 import time
 import threading
@@ -38,8 +39,14 @@ from hermes_cli.env_loader import load_hermes_dotenv  # noqa: E402
 load_hermes_dotenv()  # bring HERMES_MEET_* (profile .env) into env for the bot
 
 from plugins.google_meet import tools, process_manager as pm  # noqa: E402
+from plugins.google_meet.meet_bot import _is_farewell_candidate  # noqa: E402
 from agent.auxiliary_client import call_llm  # noqa: E402
 from agent.plugin_llm import _extract_text  # noqa: E402
+
+# Wake-word: the bot only responds when explicitly addressed by name (ASR-tolerant
+# variants of "Вертер"/"Verter"). Greeting on join and goodbye on close are the
+# only exceptions — everything else is SKIP unless the bot is named.
+_WAKE = re.compile(r"в[еэ]рт[еёэ]?р|verter|вэрт", re.IGNORECASE)
 
 MODEL = os.environ.get("DRIVER_MODEL", "gpt-5.5")
 PROVIDER = os.environ.get("DRIVER_PROVIDER", "openai-codex")
@@ -55,14 +62,18 @@ _HERMES_BIN = os.environ.get(
 _SYS = (
     "Ты — Verter, голосовой ассистент на Google Meet созвоне. Отвечай по-русски, "
     "живо и разговорно, 1-3 коротких предложения (это произносится вслух — без "
-    "разметки, списков, ссылок). Тебе дают последние реплики участников.\n"
-    "Реши по последней реплике человека:\n"
-    "- Если участники говорят между собой и тебе вмешиваться НЕ нужно → ответь "
-    "РОВНО: SKIP\n"
-    "- Если это тяжёлая задача (поиск, расчёт, анализ, написать код/документ, "
-    "долгое действие) → ответь РОВНО одной строкой: [DELEGATE] <короткое "
-    "описание задачи своими словами>\n"
-    "- Иначе → дай короткий живой устный ответ.\n"
+    "разметки, списков, ссылок).\n"
+    "ГЛАВНОЕ ПРАВИЛО: ты реагируешь ТОЛЬКО когда обращаются ЛИЧНО к тебе — по "
+    "имени «Вертер»/«Verter» или явной просьбой к тебе («Вертер, сделай…», "
+    "«спроси у Вертера…»). Если люди просто разговаривают между собой, обсуждают "
+    "что-то НЕ обращаясь к тебе — ты МОЛЧИШЬ.\n"
+    "Реши по последней реплике:\n"
+    "- Обращения к тебе нет / это разговор людей между собой → ответь РОВНО: SKIP\n"
+    "- К тебе обратились с тяжёлой задачей (поиск, расчёт, анализ, проверить "
+    "что-то, написать код/документ) → ответь РОВНО одной строкой: "
+    "[DELEGATE] <короткое описание задачи своими словами>\n"
+    "- К тебе обратились с обычным вопросом/репликой → дай короткий живой устный "
+    "ответ.\n"
     "Никогда не описывай свои действия, просто говори как человек."
 )
 
@@ -192,7 +203,8 @@ def main(argv) -> int:
     # 3) Conversation loop — deterministic cadence, point-wise LLM calls.
     cursor = -1
     convo: list = []          # rolling "Speaker: text" of the whole dialogue
-    pending_human = False     # new human content awaiting a reply
+    addressed = False         # bot was explicitly addressed in the new lines
+    farewelled = False        # we've already said our goodbye
     while True:
         st = pm.status()
         if st.get("exited") or st.get("leaveReason"):
@@ -201,30 +213,49 @@ def main(argv) -> int:
 
         tr = pm.transcript(since_id=cursor if cursor >= 0 else None)
         new = tr.get("cleanLines") or []
-        ids = tr.get("cleanLineIds") or []
         if isinstance(tr.get("maxCleanId"), int) and tr["maxCleanId"] >= 0:
             cursor = tr["maxCleanId"]
+        closing = False
         for line in new:
             speaker = line.split(":", 1)[0].strip() if ":" in line else ""
+            text = line.split(":", 1)[1].strip() if ":" in line else line
             if _is_self(speaker):
                 continue          # ignore our own TTS echo
             convo.append(line)
-            pending_human = True
+            if _WAKE.search(text):        # bot addressed by name / wake-word
+                addressed = True
+            if _is_farewell_candidate(text):
+                closing = True
         convo = convo[-MAX_CTX_LINES:]
 
-        if pending_human:
-            pending_human = False
-            msgs = [
+        # Farewell is an EXCEPTION to address-gating: finish our speech before
+        # the meeting closes (greeting + goodbye are the only unprompted lines).
+        if closing and not farewelled:
+            farewelled = True
+            bye = _llm([
+                {"role": "system", "content": _SYS},
+                {"role": "user", "content": (
+                    "Встреча завершается, участники прощаются. Скажи короткое "
+                    "тёплое прощание одной фразой. Только фраза.")},
+            ], timeout=40)
+            if bye.startswith("__ERR__") or not bye:
+                bye = "Спасибо всем, до связи!"
+            _say(bye)
+            _log(out_dir, f"farewell: {bye[:60]}")
+
+        # Normal turns: respond ONLY when explicitly addressed (by name / wake).
+        elif addressed:
+            addressed = False
+            reply = _llm([
                 {"role": "system", "content": _SYS},
                 {"role": "user", "content": (
                     "Диалог на созвоне (последние реплики):\n"
-                    + "\n".join(convo) + "\n\nТвой ход:")},
-            ]
-            reply = _llm(msgs, timeout=60)
+                    + "\n".join(convo) + "\n\nК тебе обратились. Твой ход:")},
+            ], timeout=60)
             if reply.startswith("__ERR__"):
                 _log(out_dir, f"llm err: {reply[:120]}")
             elif reply.strip().upper() == "SKIP":
-                _log(out_dir, "skip (humans talking)")
+                _log(out_dir, "skip (not really for me)")
             elif reply.strip().startswith("[DELEGATE]"):
                 task = reply.split("]", 1)[1].strip() if "]" in reply else reply
                 _say(f"Принял — делаю: {task}. Вернусь с результатом.")
