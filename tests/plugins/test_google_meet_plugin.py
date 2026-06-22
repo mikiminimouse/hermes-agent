@@ -254,6 +254,28 @@ def test_finalize_emits_monotonic_ids(tmp_path):
     assert "Alice" in state.participant_names and "Bob" in state.participant_names
 
 
+def test_live_dedup_suppresses_rescroll_duplicate(tmp_path):
+    from plugins.google_meet.meet_bot import _BotState
+
+    out = tmp_path / "s"
+    state = _BotState(out_dir=out, meeting_id="x-y-z",
+                      url="https://meet.google.com/x-y-z")
+    state.record_caption("Alice", "привет как дела")
+    state.finalize_all()                       # emits #0
+    # Meet scrolls its window and re-renders the SAME closed turn:
+    state.record_caption("Alice", "привет как дела")
+    state.finalize_all()                       # suppressed (exact dup)
+    # A fragment of an already-emitted turn is also suppressed:
+    state.record_caption("Alice", "как дела")
+    state.finalize_all()
+    entries = _clean_entries(out)
+    assert len(entries) == 1 and entries[0]["text"] == "привет как дела"
+    # A genuinely new turn still emits.
+    state.record_caption("Alice", "что нового сегодня")
+    state.finalize_all()
+    assert len(_clean_entries(out)) == 2
+
+
 def test_farewell_candidate_high_precision(tmp_path):
     from plugins.google_meet.meet_bot import _is_farewell_candidate
     # Positives — RU + EN closings.

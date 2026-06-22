@@ -170,6 +170,10 @@ class _BotState:
         # Folds growing/refining caption snapshots into one utterance; finalized
         # utterances are appended (clean) to transcript_clean.jsonl.
         self._live: dict = {}
+        # Recent finalized norm-texts per speaker (last few) — suppresses the
+        # SAME utterance being re-finalized when Meet scrolls its 2-line caption
+        # window and re-renders an already-closed turn.
+        self._recent_final: dict = {}
         out_dir.mkdir(parents=True, exist_ok=True)
         self.transcript_path = out_dir / "transcript.txt"
         self.clean_path = out_dir / "transcript_clean.jsonl"
@@ -266,14 +270,25 @@ class _BotState:
         buf = self._live.pop(speaker, None)
         if not buf or not (buf.get("text") or "").strip():
             return
+        text = buf["text"].strip()
+        norm = buf.get("norm") or _norm_caption(text)
+        # Suppress re-finalization of the SAME turn (or a fragment of one) from
+        # this speaker: Meet scrolls a 2-line caption window and re-renders
+        # already-closed turns, which would otherwise duplicate clean lines.
+        recent = self._recent_final.get(speaker, [])
+        for r in recent:
+            if norm == r or (norm and norm in r):
+                return
         entry = {
             "id": self._finalize_counter,
             "ts": time.strftime("%H:%M:%S", time.localtime(buf["started"])),
             "speaker": speaker,
-            "text": buf["text"].strip(),
+            "text": text,
         }
         self._finalize_counter += 1
-        text = entry["text"]
+        # Remember this finalized turn (keep the last few per speaker).
+        recent.append(norm)
+        self._recent_final[speaker] = recent[-6:]
         is_human = _looks_like_human_speaker(speaker, getattr(self, "guest_name", ""))
         # Track human speakers for greeting / presence (best-effort; the People
         # panel is unreliable, but whoever actually spoke is a real participant).
