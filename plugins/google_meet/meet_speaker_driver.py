@@ -25,7 +25,10 @@ from __future__ import annotations
 import os
 import re
 import sys
+import json
 import time
+import uuid
+import signal
 import difflib
 import threading
 import subprocess
@@ -105,6 +108,12 @@ REPLY_DEDUP_KEEP = _envi("DRIVER_REPLY_DEDUP_KEEP", 3, 1, 20)
 # Heavy background task: timeout for the tool-capable agent + max concurrent.
 HEAVY_TIMEOUT = _envf("DRIVER_HEAVY_TIMEOUT", 900, 30, 3600)
 MAX_HEAVY = _envi("DRIVER_MAX_HEAVY", 1, 1, 8)
+# Task-dedup: don't re-spawn a near-identical task. RATIO = similarity; KEEP =
+# how many recent tasks to compare; MAX_AGE = drop tasks older than this from the
+# dedup memory so a topic raised again much later isn't permanently blocked.
+TASK_DEDUP_RATIO = _envf("DRIVER_TASK_DEDUP_RATIO", 0.6, 0.0, 1.0)
+RECENT_TASKS_KEEP = _envi("DRIVER_RECENT_TASKS_KEEP", 6, 1, 50)
+TASK_MAX_AGE = _envf("DRIVER_TASK_MAX_AGE", 600, 0, 7200)
 # PATH for the background tool-capable agent (hermes CLI + nvm node for codex).
 _HERMES_BIN = os.environ.get(
     "DRIVER_HERMES_BIN",
@@ -132,9 +141,12 @@ def _addressed(text: str) -> bool:
 # Background-task throttle: ONE tool-capable agent at a time + dedup of
 # near-identical tasks, so a topic discussed repeatedly (with the bot named) does
 # NOT spawn a swarm of hermes -z agents (live test spawned 13 in 2 min).
+# _recent_tasks holds (norm, at) with time-decay + a hard cap so a multi-hour
+# call can't grow it without bound and a topic raised again much later isn't
+# permanently blocked. _heavy_lock guards _heavy_active AND _recent_tasks.
 _heavy_lock = threading.Lock()
 _heavy_active = 0
-_recent_tasks: list = []
+_recent_tasks: list = []   # [(norm, at)]
 
 
 def _norm_task(t: str) -> str:
@@ -146,19 +158,26 @@ def _try_delegate(task: str, context: str, out_dir) -> str:
     running or the task duplicates a recent one. Returns the line to speak."""
     global _heavy_active
     nt = _norm_task(task)
+    now = time.time()
+    task_id = uuid.uuid4().hex[:8]
     with _heavy_lock:
-        for prev in _recent_tasks[-6:]:
-            if difflib.SequenceMatcher(None, nt, prev).ratio() >= 0.6:
+        # Time-decay: drop tasks older than TASK_MAX_AGE from the dedup memory.
+        _recent_tasks[:] = [(t, a) for (t, a) in _recent_tasks if now - a < TASK_MAX_AGE]
+        for (prev, _a) in _recent_tasks[-RECENT_TASKS_KEEP:]:
+            if difflib.SequenceMatcher(None, nt, prev).ratio() >= TASK_DEDUP_RATIO:
                 return "Эту задачу я уже взял в работу — скоро вернусь с результатом."
         if _heavy_active >= MAX_HEAVY:
             return "Я ещё занят предыдущей задачей — доделаю её и сразу возьму эту."
         _heavy_active += 1
-        _recent_tasks.append(nt)
+        _recent_tasks.append((nt, now))
+        del _recent_tasks[:-100]   # hard cap: keep at most the last 100
+
+    _log(out_dir, f"delegate[{task_id}]: {task[:60]}")
 
     def _worker():
         global _heavy_active
         try:
-            _run_heavy(task, context, out_dir)
+            _run_heavy(task, context, out_dir, task_id)
         finally:
             with _heavy_lock:
                 _heavy_active -= 1
@@ -235,12 +254,75 @@ def _greeting(status) -> str:
     return g
 
 
-def _run_heavy(task: str, context: str, out_dir) -> None:
+def _heavy_env() -> dict:
+    """Env for the background agent: hermes CLI + nvm node (for codex) on PATH."""
+    env = dict(os.environ)
+    env["PATH"] = _HERMES_BIN + ":" + env.get("PATH", "")
+    return env
+
+
+def _kill_process_tree(proc: "subprocess.Popen", out_dir, task_id: str) -> None:
+    """Terminate the agent and ITS children (hermes -z spawns a node/codex child)
+    via the process group: SIGTERM, then SIGKILL after a short grace. Started
+    with start_new_session=True so the group is the agent's own — we never signal
+    the driver. Avoids the orphaned-node zombies seen with a bare proc.kill()."""
+    try:
+        pgid = os.getpgid(proc.pid)
+    except (ProcessLookupError, OSError):
+        return
+    for sig, grace in ((signal.SIGTERM, 5.0), (signal.SIGKILL, 0.0)):
+        try:
+            os.killpg(pgid, sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            return
+        if grace <= 0:
+            return
+        try:
+            proc.wait(timeout=grace)
+            return                      # exited on SIGTERM — no SIGKILL needed
+        except subprocess.TimeoutExpired:
+            _log(out_dir, f"HEAVY[{task_id}] still alive after SIGTERM → SIGKILL")
+
+
+def _run_agent_subprocess(prompt: str, out_dir, task_id: str) -> str:
+    """Run hermes -z in its OWN process group and return stdout; on timeout, kill
+    the whole tree (SIGTERM→SIGKILL). Raises FileNotFoundError if the CLI is
+    absent (caller degrades to an LLM-only answer)."""
+    proc = subprocess.Popen(
+        ["hermes", "-z", prompt, "-m", MODEL, "--profile", "verter", "--yolo"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        env=_heavy_env(), start_new_session=True)
+    try:
+        out, err = proc.communicate(timeout=HEAVY_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        _log(out_dir, f"HEAVY[{task_id}] timeout → killing tree")
+        _kill_process_tree(proc, out_dir, task_id)
+        proc.communicate()             # reap, discard partial output
+        return ""
+    out = (out or "").strip()
+    if not out:
+        _log(out_dir, f"HEAVY[{task_id}] agent empty; stderr={err[-200:] if err else ''}")
+    return out
+
+
+def _record_task(out_dir, task_id: str, task: str, ok: bool) -> None:
+    """Append a correlation record so a delegate can be matched to its result
+    in post-call analysis (out_dir/tasks.jsonl)."""
+    try:
+        with (out_dir / "tasks.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"id": task_id, "task": task, "ok": ok,
+                                "at": time.strftime("%H:%M:%S")},
+                               ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _run_heavy(task: str, context: str, out_dir, task_id: str) -> None:
     """Run a heavy task in the background with a TOOL-CAPABLE agent (hermes -z:
     web search, files, shell, skills) so it actually DOES the work, not just
     reasons. Slow (full agent), but it's off the dialogue path; the result is
     spoken when ready. Falls back to a plain LLM call if the CLI is unavailable."""
-    _log(out_dir, f"HEAVY start (agent): {task[:80]}")
+    _log(out_dir, f"HEAVY[{task_id}] start: {task[:80]}")
     prompt = (
         "Ты — Verter, выполняешь задачу, поставленную на голосовом созвоне. "
         "У тебя ЕСТЬ инструменты (поиск в сети, чтение файлов, выполнение команд, "
@@ -252,16 +334,7 @@ def _run_heavy(task: str, context: str, out_dir) -> None:
     )
     out = ""
     try:
-        env = dict(os.environ)
-        env["PATH"] = _HERMES_BIN + ":" + env.get("PATH", "")
-        r = subprocess.run(
-            ["hermes", "-z", prompt, "-m", MODEL, "--profile", "verter", "--yolo"],
-            capture_output=True, text=True, timeout=HEAVY_TIMEOUT, env=env)
-        out = (r.stdout or "").strip()
-        if not out:
-            _log(out_dir, f"HEAVY agent empty; stderr={r.stderr[-200:] if r.stderr else ''}")
-    except subprocess.TimeoutExpired:
-        _log(out_dir, "HEAVY agent timeout")
+        out = _run_agent_subprocess(prompt, out_dir, task_id)
     except FileNotFoundError:
         # No hermes CLI on PATH — degrade to an LLM-only answer.
         out = _llm([
@@ -270,12 +343,13 @@ def _run_heavy(task: str, context: str, out_dir) -> None:
         ], timeout=HEAVY_TIMEOUT)
         if out.startswith("__ERR__"):
             out = ""
+    _record_task(out_dir, task_id, task, bool(out))
     if not out:
         _say(f"Не получилось доделать задачу: {task[:60]}.")
-        _log(out_dir, "HEAVY fail")
+        _log(out_dir, f"HEAVY[{task_id}] fail")
         return
     _say("По задаче готово. " + out[:700])
-    _log(out_dir, f"HEAVY done: {out[:120]}")
+    _log(out_dir, f"HEAVY[{task_id}] done: {out[:120]}")
 
 
 def main(argv) -> int:
