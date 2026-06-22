@@ -259,6 +259,24 @@ print(os.environ['HERMES_MEET_USER_DATA_DIR'])"` → должен вывести
   сигнал закрытия; можешь сверяться с ним.
 После такого конца авто-отчёт `report.md` создаётся как обычно (graceful).
 
+## 6g. Персистентный драйвер (рекомендуемый запуск realtime)
+
+Автономный `hermes chat -q` для созвона ненадёжен: упирается в `agent.max_turns`
+(~120 итераций поллинга = ~3 мин) → харнесс прерывает → `on_session_end` гасит бот;
+плюс LLM иногда «залипает» в самодиагностике вместо речи. Поэтому ритм и время
+жизни держит детерминированный цикл:
+
+`HERMES_HOME=<verter> python -m plugins.google_meet.meet_speaker_driver <meet-url>`
+
+Драйвер (`meet_speaker_driver.py`): стартует бот в realtime, ждёт `realtimeReady`,
+здоровается (по `participantCount/Names`), затем в цикле опрашивает `cleanLines`
+курсором `sinceId` и на каждую новую человеческую реплику делает ОДИН тёплый
+in-process вызов `call_llm` (gpt-5.5, ~3.6с) → `meet_say`. LLM возвращает `SKIP`
+(не вмешиваться), `[DELEGATE] <задача>` (→ ACK голосом + фоновый поток gpt-5.5,
+диалог не блокируется) или короткий устный ответ. Конец встречи (verbal_closure/
+alone) → бот выходит → авто-отчёт. Эхо «You»/guest_name игнорируется. Модель:
+env `DRIVER_MODEL` (деф. gpt-5.5), `DRIVER_PROVIDER` (openai-codex).
+
 ## 7. Частые ошибки (НЕ повторяй)
 
 - **Слишком короткое окно admission.** 2 минуты мало — хост не успевает впустить.
