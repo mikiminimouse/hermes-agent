@@ -29,6 +29,50 @@ DEFAULT_SILERO_VOICE = "eugene"
 DEFAULT_SILERO_MODEL = "v4_ru"
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?…])\s+|\n+")
 
+# B2: Silero v4_ru is monolingual Russian — Latin letters fall outside its
+# vocabulary and English words are DROPPED (silently, the field complaint), not
+# mispronounced. Until a code-switching engine lands (Qwen3-TTS, P2), we make
+# mixed RU/EN audible by transliterating only the Latin runs to Cyrillic so the
+# Russian engine voices them phonetically (accented but present). Cyrillic text
+# is untouched. Toggle with HERMES_MEET_TTS_TRANSLIT=0.
+_LATIN_RUN_RE = re.compile(r"[A-Za-z]+")
+# Ordered longest-first so digraphs win over single letters.
+_TRANSLIT_RULES = [
+    ("sch", "ш"), ("tch", "ч"), ("igh", "ай"),
+    ("sh", "ш"), ("ch", "ч"), ("ph", "ф"), ("ck", "к"),
+    ("qu", "кв"), ("oo", "у"), ("ee", "и"), ("ea", "и"), ("ou", "ау"),
+    ("ow", "оу"), ("ai", "эй"), ("ay", "эй"), ("ey", "эй"), ("oa", "оу"),
+    ("ja", "я"), ("ju", "ю"), ("yo", "ё"),
+    ("a", "а"), ("b", "б"), ("c", "к"), ("d", "д"), ("e", "е"), ("f", "ф"),
+    ("g", "г"), ("h", "х"), ("i", "и"), ("j", "дж"), ("k", "к"), ("l", "л"),
+    ("m", "м"), ("n", "н"), ("o", "о"), ("p", "п"), ("q", "к"), ("r", "р"),
+    ("s", "с"), ("t", "т"), ("u", "а"), ("v", "в"), ("w", "в"), ("x", "кс"),
+    ("y", "й"), ("z", "з"),
+]
+
+
+def _translit_word(w: str) -> str:
+    """Phonetically transliterate one Latin run to Cyrillic (rough but audible)."""
+    s = w.lower()
+    out = []
+    i = 0
+    while i < len(s):
+        for pat, rep in _TRANSLIT_RULES:
+            if s.startswith(pat, i):
+                out.append(rep)
+                i += len(pat)
+                break
+        else:  # unknown char (shouldn't happen — run is [A-Za-z]) → skip
+            i += 1
+    return "".join(out)
+
+
+def _transliterate_latin(text: str) -> str:
+    """Replace Latin runs with Cyrillic transliteration; leave Cyrillic as-is."""
+    if not text or os.environ.get("HERMES_MEET_TTS_TRANSLIT", "1") == "0":
+        return text
+    return _LATIN_RUN_RE.sub(lambda m: _translit_word(m.group(0)), text)
+
 
 def _split_sentences(text: str) -> list:
     text = (text or "").strip()
@@ -102,6 +146,7 @@ class SileroSpeaker:
         if self._model is None:
             return {"ok": False, "error": "silero model not connected"}
         self._cancel.clear()
+        text = _transliterate_latin(text)   # B2: make Latin words audible
         total = 0
         sink = None
         if self.audio_sink_path is not None:
