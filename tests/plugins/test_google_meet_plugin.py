@@ -338,7 +338,7 @@ def test_farewell_candidate_high_precision(tmp_path):
     # Positives — only unambiguously TERMINAL closings.
     for t in ["Всем спасибо, до свидания!", "Давайте заканчивать встречу",
               "На этом всё, расходимся", "Ок, see you later", "Let's wrap up",
-              "пора заканчивать созвон"]:
+              "всем пока, до встречи"]:
         assert _is_farewell_candidate(t), t
     # Negatives — polite mid-meeting formulas must NOT count as a farewell
     # (these used to false-fire and could end a live meeting — review blocker F2).
