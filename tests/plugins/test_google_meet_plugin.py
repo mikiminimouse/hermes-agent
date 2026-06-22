@@ -1106,9 +1106,47 @@ def test_detect_admission_true_when_probe_returns_true():
     from plugins.google_meet.meet_bot import _detect_admission
 
     class _FakePage:
-        def evaluate(self, _js): return True
+        def evaluate(self, _js):
+            return {"admitted": True, "admitReason": "leave_button",
+                    "phase": "in_call", "alone": False,
+                    "aloneReason": "pcount_ge2", "participantCount": 3}
 
     assert _detect_admission(_FakePage()) is True
+
+
+def test_meet_state_probe_wrappers_share_one_pass():
+    # К2: _detect_admission / _detect_alone / _get_participant_count all read the
+    # same _meet_state_probe dict (one source of DOM logic + reason strings).
+    from plugins.google_meet.meet_bot import (
+        _meet_state_probe, _detect_admission, _detect_alone, _get_participant_count,
+    )
+
+    class _FakePage:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def evaluate(self, _js):
+            return self.payload
+
+    in_call_alone = _FakePage({
+        "admitted": True, "admitReason": "call_end_or_chat", "phase": "in_call",
+        "alone": True, "aloneReason": "pcount_1", "participantCount": 1})
+    assert _detect_admission(in_call_alone) is True
+    assert _detect_alone(in_call_alone) is True
+    assert _get_participant_count(in_call_alone) == 1
+    assert _meet_state_probe(in_call_alone)["admitReason"] == "call_end_or_chat"
+
+    lobby = _FakePage({
+        "admitted": False, "admitReason": "lobby_text", "phase": "lobby",
+        "alone": False, "aloneReason": "unknown", "participantCount": None})
+    assert _detect_admission(lobby) is False
+    assert _get_participant_count(lobby) is None
+
+    # Any error → conservative all-false/unknown dict (never raises into loop).
+    class _BoomPage:
+        def evaluate(self, _js): raise RuntimeError("boom")
+    probe = _meet_state_probe(_BoomPage())
+    assert probe["admitted"] is False and probe["admitReason"] == "probe_error"
 
 
 def test_try_guest_name_uses_fallback_textbox_role():
@@ -1565,9 +1603,10 @@ def test_set_caption_language_escapes_and_forces_russian():
 
 def test_detect_admission_drops_dead_jsname_and_adds_ru():
     import inspect
-    from plugins.google_meet.meet_bot import _detect_admission
+    # К2: the admission guards now live in the unified _meet_state_probe.
+    from plugins.google_meet.meet_bot import _meet_state_probe
 
-    src = inspect.getsource(_detect_admission)
+    src = inspect.getsource(_meet_state_probe)
     assert "call_end" in src             # locale-independent hangup ligature
     assert 'jsname="YSxPC"' not in src   # dead legacy selector removed
     # The caption-region signal was REMOVED (it false-positived in the lobby,
@@ -1578,9 +1617,10 @@ def test_detect_admission_drops_dead_jsname_and_adds_ru():
 
 def test_detect_admission_has_lobby_guard():
     import inspect
-    from plugins.google_meet.meet_bot import _detect_admission
+    # К2: lobby guard now lives in the unified _meet_state_probe.
+    from plugins.google_meet.meet_bot import _meet_state_probe
 
-    src = inspect.getsource(_detect_admission)
+    src = inspect.getsource(_meet_state_probe)
     # Lobby is identified by its "waiting for host" copy because the lobby
     # hangup button shares aria "Leave call" with the in-call one.
     assert "please wait until" in src.lower()

@@ -1371,7 +1371,8 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
                 # Admission detection every ~3s until admitted.
                 if not state.in_call and (now - last_admission_check) > 3.0:
                     last_admission_check = now
-                    admitted = _detect_admission(page)
+                    _probe = _meet_state_probe(page)   # К2: reason for debugging
+                    admitted = bool(_probe.get("admitted"))
                     if not admitted:
                         # Re-click a still-visible "Join now"/"Ask to join": the
                         # first click can land before the button renders or not
@@ -1379,6 +1380,8 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
                         # pre-join screen forever (seen in the field).
                         _click_join(page, state)
                     if admitted:
+                        print(f"[meet_bot] admitted (reason={_probe.get('admitReason')}, "
+                              f"phase={_probe.get('phase')})", flush=True)
                         state.set(
                             in_call=True,
                             lobby_waiting=False,
@@ -1782,142 +1785,129 @@ def _dump_admission_snapshot(page, out_dir, note: str) -> None:
         pass
 
 
-def _detect_admission(page) -> bool:
-    """True if we're clearly past the lobby and in the call itself.
+def _meet_state_probe(page) -> dict:
+    """К2: ONE JS pass that reads Meet's (drifting) DOM and returns the whole
+    meeting state at once, each signal tagged with the REASON it fired so a
+    field failure is debuggable:
 
-    Uses a JS-side probe because Meet's DOM structure varies by client
-    version. We check several high-signal indicators and declare admission
-    on the first hit:
+        {admitted, admitReason, phase, alone, aloneReason, participantCount}
 
-      1. Leave-call button is present (``aria-label`` contains "eave call").
-      2. Caption region has appeared (we installed the observer and it attached).
-      3. The participant list container is visible.
+      * phase ∈ loading | lobby | pre_join | in_call | unknown — a coarse state
+        envelope (UNKNOWN → LOBBY/PRE_JOIN → IN_CALL).
+      * admitted: past the lobby and in the call itself. Guards run in order:
+        DOM-loaded → not lobby copy → no VISIBLE join button → then leave-button
+        / call_end|chat ligature / participants container / people button.
+      * alone: the bot is the only one left (alone copy, or participantCount==1).
+      * participantCount: explicit numeric count or null (parsed ONCE, shared by
+        alone + greeting — used to be duplicated across two probes).
 
-    Conservative by default — returns False on any error.
-    """
+    The thin _detect_admission / _detect_alone / _get_participant_count wrappers
+    below preserve the old call sites + cadences. Returns a conservative
+    all-false/unknown dict on any error (never raises into the loop)."""
     probe = r"""
     (() => {
       const buttons = Array.from(document.querySelectorAll('button'));
-      // 0) LOBBY GUARD (must run first): the lobby's hangup button has the SAME
-      // aria "Leave call" + 'call_end' ligature as the in-call one, so the leave
-      // button cannot distinguish lobby from call. The lobby is identified by
-      // its "waiting for host" copy instead — if present, we are NOT admitted.
       const body = document.body ? (document.body.innerText || '') : '';
-      // DOM-not-loaded guard: an empty/short body means the page is mid-load —
-      // declaring admission here was the empty-body race that latched in_call in
-      // the lobby. Wait for a real render.
-      if (!body || body.trim().length < 40) return false;
-      if (/please wait until|asking to be let in|wait(ing)? for the host|you'?ll join the call when|подождите,? пока|вас впуст|ожидайте|организатор.*впуст|запрос на присоединение отправлен/i.test(body)) {
-        return false;
+
+      // ---- shared participant-count parse (one place, was duplicated) -------
+      let participantCount = null;
+      {
+        const els = [...document.querySelectorAll('button,[role="button"],[aria-label]')];
+        for (const e of els) {
+          const a = e.getAttribute('aria-label') || '';
+          const m = a.match(/(participants|people|участник[аи]?)\D{0,4}(\d+)/i)
+                 || a.match(/(\d+)\D{0,4}(participants|people|участник)/i);
+          if (m) {
+            const n = parseInt(/\d/.test(m[2] || '') ? m[2] : m[1], 10);
+            if (Number.isFinite(n) && n > 0) { participantCount = n; break; }
+          }
+        }
       }
-      // PRE-JOIN GUARD: if a join / ask-to-join button is on screen we're on the
-      // device-preview/lobby page, NOT admitted. The caption container + observer
-      // can already exist here, which falsely tripped the old caption-region
-      // check and latched in_call=True while still in the lobby.
-      const vis = (b) => !!(b.offsetWidth || b.offsetHeight || b.getClientRects().length);
-      const joinBtn = buttons.find((b) => {
-        if (!vis(b)) return false;   // Meet keeps a HIDDEN "Ask to join" in the
-                                     // DOM after admission — only a VISIBLE one
-                                     // means we're really on the pre-join screen.
-        const t = `${b.innerText || ''} ${b.getAttribute('aria-label') || ''}`.toLowerCase();
-        return /join now|ask to join|switch here|присоедин|попросить присоедин/.test(t);
-      });
-      if (joinBtn) return false;
-      // 1) In-call leave button by RU/EN aria text.
-      const leave = buttons.find((b) => {
-        const text = `${b.innerText || ''} ${b.getAttribute('aria-label') || ''}`;
-        return /leave call|leave meeting|покинуть видеовстреч|покинуть вызов|покинуть звон|выйти из вызова|выйти из звон/i.test(text);
-      });
-      if (leave) return true;
-      // 2) In-call toolbar ligatures: the hangup (call_end) + chat buttons. The
-      // lobby/pre-join screens were already excluded by the guards above, and the
-      // device-preview has Join/Ask-to-join (no call_end, no chat) — so on a
-      // loaded non-lobby page these mean we ARE in the call. (Replaces the old
-      // caption-region check, which existed pre-admission and false-positived.)
-      const inCallBtn = buttons.some((b) => {
-        const inner = (b.innerText || '').trim().toLowerCase();
-        const aria = (b.getAttribute('aria-label') || '').toLowerCase();
-        return inner === 'call_end' || inner === 'chat'
-            || /chat with everyone|чат с участ/.test(aria);
-      });
-      if (inCallBtn) return true;
-      // 3) Participants container — RU/EN aria or people/group ligature button.
-      const parts = document.querySelector(
-        '[aria-label*="articipants" i], [aria-label*="участник" i]'
-      );
-      if (parts) return true;
-      const partBtn = buttons.some((b) => /^(people|group)$/i.test((b.innerText || '').trim()));
-      if (partBtn) return true;
-      return false;
+
+      // ---- admission (guards in order; first hit wins) ---------------------
+      let admitted = false, admitReason = 'no_signal', phase = 'unknown';
+      // DOM-not-loaded guard: short body = page mid-load (the empty-body race
+      // that once latched in_call in the lobby). Wait for a real render.
+      if (!body || body.trim().length < 40) {
+        phase = 'loading'; admitReason = 'dom_empty';
+      } else if (/please wait until|asking to be let in|wait(ing)? for the host|you'?ll join the call when|подождите,? пока|вас впуст|ожидайте|организатор.*впуст|запрос на присоединение отправлен/i.test(body)) {
+        // LOBBY GUARD: the lobby hangup button shares aria "Leave call" +
+        // call_end with the in-call one, so only the "waiting for host" copy
+        // distinguishes lobby from call.
+        phase = 'lobby'; admitReason = 'lobby_text';
+      } else {
+        const vis = (b) => !!(b.offsetWidth || b.offsetHeight || b.getClientRects().length);
+        // PRE-JOIN GUARD: a VISIBLE join/ask-to-join button = device-preview/
+        // lobby, NOT admitted. Meet keeps a HIDDEN "Ask to join" in the DOM
+        // after admission, so only a visible one counts.
+        const joinBtn = buttons.find((b) => {
+          if (!vis(b)) return false;
+          const t = `${b.innerText || ''} ${b.getAttribute('aria-label') || ''}`.toLowerCase();
+          return /join now|ask to join|switch here|присоедин|попросить присоедин/.test(t);
+        });
+        if (joinBtn) {
+          phase = 'pre_join'; admitReason = 'pre_join_visible';
+        } else if (buttons.find((b) => {
+          const text = `${b.innerText || ''} ${b.getAttribute('aria-label') || ''}`;
+          return /leave call|leave meeting|покинуть видеовстреч|покинуть вызов|покинуть звон|выйти из вызова|выйти из звон/i.test(text);
+        })) {
+          admitted = true; phase = 'in_call'; admitReason = 'leave_button';
+        } else if (buttons.some((b) => {
+          const inner = (b.innerText || '').trim().toLowerCase();
+          const aria = (b.getAttribute('aria-label') || '').toLowerCase();
+          return inner === 'call_end' || inner === 'chat'
+              || /chat with everyone|чат с участ/.test(aria);
+        })) {
+          // In-call toolbar ligatures (lobby/pre-join already excluded above).
+          admitted = true; phase = 'in_call'; admitReason = 'call_end_or_chat';
+        } else if (document.querySelector('[aria-label*="articipants" i], [aria-label*="участник" i]')) {
+          admitted = true; phase = 'in_call'; admitReason = 'participants_container';
+        } else if (buttons.some((b) => /^(people|group)$/i.test((b.innerText || '').trim()))) {
+          admitted = true; phase = 'in_call'; admitReason = 'people_button';
+        }
+      }
+
+      // ---- alone (only trusted in-call) ------------------------------------
+      let alone = false, aloneReason = 'unknown';
+      if (/no one else is here|you'?re the only one|everyone else (has )?left|waiting for others to join/i.test(body)
+          || /кроме вас,? здесь больше никого|вы единственный участник|все остальные вышли|больше никого нет/i.test(body)) {
+        alone = true; aloneReason = 'alone_text';
+      } else if (participantCount === 1) {
+        alone = true; aloneReason = 'pcount_1';
+      } else if (participantCount >= 2) {
+        alone = false; aloneReason = 'pcount_ge2';
+      }
+
+      return { admitted, admitReason, phase, alone, aloneReason, participantCount };
     })();
     """
     try:
-        return bool(page.evaluate(probe))
+        r = page.evaluate(probe)
+        if isinstance(r, dict):
+            return r
     except Exception:
-        return False
+        pass
+    return {"admitted": False, "admitReason": "probe_error", "phase": "unknown",
+            "alone": False, "aloneReason": "probe_error", "participantCount": None}
+
+
+def _detect_admission(page) -> bool:
+    """True if we're clearly past the lobby and in the call. Thin wrapper over
+    _meet_state_probe (single source of the admission guards)."""
+    return bool(_meet_state_probe(page).get("admitted"))
 
 
 def _detect_alone(page) -> bool:
-    """True when the bot is the ONLY participant left (everyone else has gone).
-
-    Used to auto-end the meeting (and trigger summarization) once the humans
-    leave. Two signals: Meet's "no one else" copy (RU+EN), and a participant
-    count of 1 parsed from the people button / call header. Conservative:
-    returns False on any error or ambiguity (better to linger than leave early).
-    """
-    probe = r"""
-    (() => {
-      const body = document.body ? (document.body.innerText || '') : '';
-      // 1) Explicit "you're alone" copy.
-      if (/no one else is here|you'?re the only one|everyone else (has )?left|waiting for others to join/i.test(body)) return true;
-      if (/кроме вас,? здесь больше никого|вы единственный участник|все остальные вышли|больше никого нет/i.test(body)) return true;
-      // 2) Participant count == 1 (people button / aria like "Participants, 1"
-      //    or RU "Участники, 1"). Only trust an explicit numeric count.
-      const els = [...document.querySelectorAll('button,[role="button"],[aria-label]')];
-      for (const e of els) {
-        const a = e.getAttribute('aria-label') || '';
-        const m = a.match(/(participants|people|участник[аи]?)\D{0,4}(\d+)/i)
-               || a.match(/(\d+)\D{0,4}(participants|people|участник)/i);
-        if (m) {
-          const n = parseInt(m[2] && /\d/.test(m[2]) ? m[2] : m[1], 10);
-          if (n === 1) return true;
-          if (n >= 2) return false;
-        }
-      }
-      return false;
-    })();
-    """
-    try:
-        return bool(page.evaluate(probe))
-    except Exception:
-        return False
+    """True when the bot is the ONLY participant left. Conservative (False on
+    ambiguity). Thin wrapper over _meet_state_probe."""
+    return bool(_meet_state_probe(page).get("alone"))
 
 
 def _get_participant_count(page) -> Optional[int]:
-    """Best-effort participant count from Meet's people button / call-header
-    aria-labels (RU+EN). Returns None when no explicit numeric count is visible
-    (degrade gracefully — caller treats None as "unknown"). Drives greeting
-    phrasing (1 vs team) and the presence half of verbal-closure end-detection."""
-    probe = r"""
-    (() => {
-      const els = [...document.querySelectorAll('button,[role="button"],[aria-label]')];
-      for (const e of els) {
-        const a = e.getAttribute('aria-label') || '';
-        const m = a.match(/(participants|people|участник[аи]?)\D{0,4}(\d+)/i)
-               || a.match(/(\d+)\D{0,4}(participants|people|участник)/i);
-        if (m) {
-          const n = parseInt(/\d/.test(m[2] || '') ? m[2] : m[1], 10);
-          if (Number.isFinite(n) && n > 0) return n;
-        }
-      }
-      return null;
-    })();
-    """
-    try:
-        v = page.evaluate(probe)
-        return int(v) if isinstance(v, (int, float)) and v > 0 else None
-    except Exception:
-        return None
+    """Best-effort participant count (None when no explicit count is visible —
+    caller treats None as 'unknown'). Thin wrapper over _meet_state_probe."""
+    v = _meet_state_probe(page).get("participantCount")
+    return int(v) if isinstance(v, (int, float)) and v > 0 else None
 
 
 def _dump_caption_dom(page, out_dir) -> None:
