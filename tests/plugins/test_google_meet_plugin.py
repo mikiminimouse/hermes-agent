@@ -195,6 +195,54 @@ def test_live_dedup_idle_finalization(tmp_path):
     assert len(entries) == 1 and entries[0]["text"] == "реплика на паузу"
 
 
+def test_dialogue_end_reason(tmp_path):
+    # К3: end-detection lives in the bot, derived from the DIALOGUE (no DOM).
+    from plugins.google_meet.meet_bot import (
+        _BotState, _END_GRACE, _MAX_IDLE,
+    )
+
+    def _state():
+        s = _BotState(out_dir=tmp_path / "s", meeting_id="x-y-z",
+                      url="https://meet.google.com/x-y-z")
+        s.in_call = True
+        return s
+
+    t0 = 1_000_000.0
+
+    # No human has spoken yet → never end.
+    s = _state()
+    assert s.dialogue_end_reason(t0) is None
+
+    # Farewell was the LAST human utterance + END_GRACE of silence → verbal_closure.
+    s = _state()
+    s.had_human = True
+    s.last_human_at = t0
+    s.meeting_closing_at = t0          # farewell == last human turn
+    assert s.dialogue_end_reason(t0 + _END_GRACE - 1) is None      # not yet
+    assert s.dialogue_end_reason(t0 + _END_GRACE + 1) == "verbal_closure"
+
+    # A human spoke AFTER the farewell → not a closure; quiet < MAX_IDLE → keep going.
+    s = _state()
+    s.had_human = True
+    s.meeting_closing_at = t0
+    s.last_human_at = t0 + 60          # someone talked after the "farewell"
+    assert s.dialogue_end_reason(t0 + 60 + _END_GRACE + 1) is None
+
+    # No farewell, but nobody spoke for MAX_IDLE → idle backstop.
+    s = _state()
+    s.had_human = True
+    s.last_human_at = t0
+    assert s.dialogue_end_reason(t0 + _MAX_IDLE - 1) is None
+    assert s.dialogue_end_reason(t0 + _MAX_IDLE + 1) == "idle"
+
+    # Not in call → never end.
+    s = _state()
+    s.in_call = False
+    s.had_human = True
+    s.last_human_at = t0
+    assert s.dialogue_end_reason(t0 + _MAX_IDLE + 1) is None
+
+
 def test_transcript_reader_exposes_clean_lines(tmp_path):
     from plugins.google_meet import process_manager as pm
 

@@ -40,7 +40,6 @@ from hermes_cli.env_loader import load_hermes_dotenv  # noqa: E402
 load_hermes_dotenv()  # bring HERMES_MEET_* (profile .env) into env for the bot
 
 from plugins.google_meet import tools, process_manager as pm  # noqa: E402
-from plugins.google_meet.meet_bot import _is_farewell_candidate  # noqa: E402
 from agent.auxiliary_client import call_llm  # noqa: E402
 from agent.plugin_llm import _extract_text  # noqa: E402
 
@@ -89,12 +88,10 @@ MAX_CTX_LINES = _envi("DRIVER_MAX_CTX_LINES", 24, 4, 200)  # dialogue lines → 
 # older comments drifted and conflated the two (0.8 here vs 0.72 there).
 ADDRESS_FUZZY_RATIO = _envf("DRIVER_ADDRESS_FUZZY_RATIO", 0.8, 0.5, 1.0)
 
-# End-of-meeting from the DIALOGUE (not the fragile DOM participantCount, which
-# returned None in the field): after a farewell, leave once humans go quiet for
-# END_GRACE; backstop — leave after MAX_IDLE of NO human speech at all (0
-# disables). Independent of _detect_alone/participantCount.
-END_GRACE = _envf("DRIVER_END_GRACE", 25, 0, 600)
-MAX_IDLE = _envf("DRIVER_MAX_IDLE", 300, 0, 3600)
+# End-of-meeting detection now lives in the BOT (К3: single source of truth —
+# HERMES_MEET_END_GRACE / HERMES_MEET_MAX_IDLE), which sets leaveReason from the
+# dialogue. The driver only CONSUMES leaveReason/exited (and a process-death
+# watchdog); it no longer runs its own END_GRACE/MAX_IDLE policy.
 
 # Reply-dedup: suppress a reply only if it's too similar to one of the LAST FEW
 # replies (not a time window). RATIO = similarity threshold; KEEP = how many
@@ -344,25 +341,29 @@ def main(argv) -> int:
         _log(out_dir, "greeting produced no audio — retrying")
 
     # 3) Conversation loop — deterministic cadence, point-wise LLM calls.
+    # End-detection is the BOT's job now (К3): we exit on leaveReason/exited or a
+    # process-death watchdog, and we voice a goodbye when the bot reports a
+    # farewell (status.farewellDetectedAt) — we no longer detect farewell or run
+    # idle timers ourselves.
     cursor = -1
     convo: list = []          # rolling "Speaker: text" of the whole dialogue
     addressed = False         # bot was explicitly addressed in the new lines
     farewelled = False        # we've already said our goodbye
     recent_replies: list = []   # norms of the last REPLY_DEDUP_KEEP replies
-    last_human_at = time.time()   # presence signal: when a human last spoke
-    had_human = False
     llm_err_streak = 0          # consecutive LLM failures → circuit-breaker
     while True:
         st = pm.status()
         if st.get("exited") or st.get("leaveReason"):
             _log(out_dir, f"end: leaveReason={st.get('leaveReason')} exited={st.get('exited')}")
             break
+        if not st.get("alive"):   # watchdog: bot process gone → stop driving
+            _log(out_dir, "end: bot process not alive → leaving")
+            break
 
         tr = pm.transcript(since_id=cursor if cursor >= 0 else None)
         new = tr.get("cleanLines") or []
         if isinstance(tr.get("maxCleanId"), int) and tr["maxCleanId"] >= 0:
             cursor = tr["maxCleanId"]
-        closing = False
         addressed = False   # per-batch: reset every tick so it never lingers
         for line in new:
             speaker = line.split(":", 1)[0].strip() if ":" in line else ""
@@ -370,17 +371,14 @@ def main(argv) -> int:
             if _is_self(speaker):
                 continue          # ignore our own TTS echo
             convo.append(line)
-            last_human_at = time.time()   # a human just spoke → presence
-            had_human = True
             if _addressed(text):          # bot called by name (ASR-fuzzy)
                 addressed = True
-            if _is_farewell_candidate(text):
-                closing = True
         convo = convo[-MAX_CTX_LINES:]
 
-        # Farewell is an EXCEPTION to address-gating: finish our speech before
-        # the meeting closes (greeting + goodbye are the only unprompted lines).
-        if closing and not farewelled:
+        # Goodbye is an EXCEPTION to address-gating: the bot detected a farewell
+        # (single-source) → finish our speech before it leaves. Greeting + goodbye
+        # are the only unprompted lines.
+        if st.get("farewellDetectedAt") and not farewelled:
             farewelled = True
             bye = _llm([
                 {"role": "system", "content": _SYS},
@@ -440,17 +438,8 @@ def main(argv) -> int:
                         del recent_replies[:-REPLY_DEDUP_KEEP]
                         _log(out_dir, f"said [llm {_llm_dt:.1f}s say {time.time()-_t_say0:.1f}s]: {reply[:80]}")
 
-        # End the meeting from the DIALOGUE (no reliance on participantCount):
-        # a farewell happened and the humans have gone quiet, or nobody has
-        # spoken for a long time at all.
-        idle = time.time() - last_human_at
-        if farewelled and idle > END_GRACE:
-            _log(out_dir, f"end: farewell + {int(idle)}s silence → leaving")
-            break
-        if MAX_IDLE > 0 and had_human and idle > MAX_IDLE:
-            _log(out_dir, f"end: {int(idle)}s no human speech → leaving")
-            break
-
+        # NB: meeting end is decided by the BOT (К3) and observed at the top of
+        # the loop via leaveReason/exited/alive — no driver-side idle timers here.
         time.sleep(POLL_SEC)
 
     # 4) Graceful stop (bot may already be gone; this is idempotent → summary).

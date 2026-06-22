@@ -98,6 +98,15 @@ _CAPTION_WS_RE = re.compile(r"\s+")
 # pause between turns. Env-overridable for live tuning; tests also patch it.
 _CAPTION_FINALIZE_PAUSE = float(os.environ.get("HERMES_MEET_FINALIZE_PAUSE", "2.0"))
 
+# К3: dialogue-based auto-end. The BOT owns end-detection (it has the captions =
+# ground truth for who actually spoke); the speaker driver only consumes
+# leaveReason. After a human farewell, leave once humans go quiet for END_GRACE;
+# backstop — leave after MAX_IDLE of NO human speech at all (0 disables). This is
+# the reliable signal that does NOT depend on the DOM participantCount (which
+# returned None in the field — B6). Was duplicated in the driver; now single-source.
+_END_GRACE = float(os.environ.get("HERMES_MEET_END_GRACE", "25"))
+_MAX_IDLE = float(os.environ.get("HERMES_MEET_MAX_IDLE", "300"))
+
 
 def _caption_norm_words(text: str) -> list[str]:
     return _norm_caption(text).split()
@@ -220,6 +229,10 @@ class _BotState:
         # with a presence-drop it triggers a graceful 'verbal_closure' exit.
         self.meeting_closing_at: Optional[float] = None
         self.closing_path = out_dir / "meeting_closing.json"
+        # К3: presence FROM THE DIALOGUE (when a human last spoke) — the reliable
+        # input to dialogue-based auto-end, independent of the DOM participantCount.
+        self.last_human_at: Optional[float] = None
+        self.had_human: bool = False
         self._flush()
 
     def _next_clean_id(self) -> int:
@@ -350,6 +363,10 @@ class _BotState:
         # panel is unreliable, but whoever actually spoke is a real participant).
         if is_human and speaker not in self.participant_names:
             self.participant_names.append(speaker)
+        # К3: a human just spoke → presence signal for dialogue-based auto-end.
+        if is_human:
+            self.last_human_at = time.time()
+            self.had_human = True
         # Closing candidate: a human said something that reads like a farewell.
         # Recorded only; the actual graceful exit needs presence-drop too.
         if is_human and _is_farewell_candidate(text):
@@ -408,6 +425,29 @@ class _BotState:
             if ref - self._live[speaker]["updated"] >= _CAPTION_FINALIZE_PAUSE:
                 self._finalize_speaker(speaker)
 
+    def dialogue_end_reason(self, now: float) -> Optional[str]:
+        """К3: decide whether the meeting should end, from the DIALOGUE alone —
+        no DOM participantCount (which was None in the field, B6). Returns the
+        leave_reason to use, or None to keep going.
+
+        - ``verbal_closure``: a human farewell was the LAST human utterance and
+          humans have been quiet for END_GRACE (so the bot's own goodbye, which
+          isn't a human caption, doesn't reset the timer).
+        - ``idle``: no human has spoken at all for MAX_IDLE (0 disables).
+        """
+        if not self.in_call or self.last_human_at is None:
+            return None
+        quiet = now - self.last_human_at
+        farewell_last = (
+            self.meeting_closing_at is not None
+            and self.last_human_at - self.meeting_closing_at <= 0.5
+        )
+        if farewell_last and quiet >= _END_GRACE:
+            return "verbal_closure"
+        if _MAX_IDLE > 0 and self.had_human and quiet >= _MAX_IDLE:
+            return "idle"
+        return None
+
     def finalize_all(self) -> None:
         """Flush all in-progress utterances (call at meeting teardown)."""
         for speaker in list(self._live.keys()):
@@ -447,6 +487,11 @@ class _BotState:
             "participantNames": list(self.participant_names),
             "greeted": self.greeted,
             "admittedAt": self.admitted_at,
+            # К3: dialogue-end signals the driver consumes (it produces NONE of
+            # its own). farewellDetectedAt → drives the driver's goodbye line;
+            # leaveReason → drives the driver's exit.
+            "farewellDetectedAt": self.meeting_closing_at,
+            "lastHumanAt": self.last_human_at,
         }
         tmp = self.status_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -1367,6 +1412,15 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
                             state.set(leave_reason="alone")
                             break
 
+                # Dialogue-based auto-end (К3) — the RELIABLE end signal, with no
+                # dependence on the DOM participantCount (None in the field, B6).
+                # This is what the speaker driver used to do; it now lives here so
+                # there is a single source of truth for ending.
+                _end_reason = state.dialogue_end_reason(now)
+                if _end_reason:
+                    state.set(leave_reason=_end_reason)
+                    break
+
                 # Captions can only be turned on in-call, so enable them after
                 # admission. Keep retrying (throttled ~3s) until captions
                 # actually produce lines — the caption button can settle several
@@ -1517,7 +1571,7 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
             # bot actually attended (alone / duration / host-left / explicit
             # leave / page closed) — never for denied or lobby_timeout, which
             # request_summary() also guards by joined_at/transcript_lines.
-            GRACEFUL_END = {"alone", "duration_expired", "meet_leave",
+            GRACEFUL_END = {"alone", "idle", "duration_expired", "meet_leave",
                             "page_closed", "verbal_closure", None}
             if state.leave_reason in GRACEFUL_END:
                 try:
