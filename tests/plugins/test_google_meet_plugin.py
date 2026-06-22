@@ -115,6 +115,101 @@ def test_bot_state_ignores_blank_text(tmp_path):
     assert "Unknown: text but no speaker" in (tmp_path / "s" / "transcript.txt").read_text()
 
 
+# ---------------------------------------------------------------------------
+# Live caption dedup (Vexa-inspired) — transcript_clean.jsonl
+# ---------------------------------------------------------------------------
+
+def _clean_entries(out):
+    import json as _j
+    p = out / "transcript_clean.jsonl"
+    if not p.is_file():
+        return []
+    return [_j.loads(ln) for ln in p.read_text().splitlines() if ln.strip()]
+
+
+def test_live_dedup_folds_growing_captions(tmp_path):
+    from plugins.google_meet.meet_bot import _BotState
+
+    out = tmp_path / "session"
+    state = _BotState(out_dir=out, meeting_id="abc-defg-hij",
+                      url="https://meet.google.com/abc-defg-hij")
+    # Google Meet grows ONE caption row in place.
+    for t in ("Привет", "Привет мир", "Привет мир как", "Привет мир как дела"):
+        state.record_caption("Alice", t)
+    state.finalize_all()
+
+    entries = _clean_entries(out)
+    # All four growing snapshots collapse into ONE finalized utterance.
+    assert len(entries) == 1
+    assert entries[0]["speaker"] == "Alice"
+    assert entries[0]["text"] == "Привет мир как дела"
+    # Raw transcript still keeps every snapshot (feeds the post-call collapse).
+    assert (out / "transcript.txt").read_text().count("Alice:") == 4
+
+
+def test_live_dedup_punctuation_and_case_fold(tmp_path):
+    from plugins.google_meet.meet_bot import _BotState
+
+    out = tmp_path / "s"
+    state = _BotState(out_dir=out, meeting_id="x-y-z",
+                      url="https://meet.google.com/x-y-z")
+    # Case + punctuation drift must NOT split the utterance.
+    state.record_caption("Bob", "hello world")
+    state.record_caption("Bob", "Hello, world!")
+    state.finalize_all()
+
+    entries = _clean_entries(out)
+    assert len(entries) == 1
+    assert entries[0]["speaker"] == "Bob"
+
+
+def test_live_dedup_divergence_starts_new_utterance(tmp_path):
+    from plugins.google_meet.meet_bot import _BotState
+
+    out = tmp_path / "s"
+    state = _BotState(out_dir=out, meeting_id="x-y-z",
+                      url="https://meet.google.com/x-y-z")
+    state.record_caption("Alice", "первая мысль целиком")
+    state.record_caption("Alice", "совсем другая реплика")  # divergence
+    state.finalize_all()
+
+    entries = _clean_entries(out)
+    assert [e["text"] for e in entries] == ["первая мысль целиком",
+                                            "совсем другая реплика"]
+
+
+def test_live_dedup_idle_finalization(tmp_path):
+    import time
+    from plugins.google_meet.meet_bot import _BotState, _CAPTION_FINALIZE_PAUSE
+
+    out = tmp_path / "s"
+    state = _BotState(out_dir=out, meeting_id="x-y-z",
+                      url="https://meet.google.com/x-y-z")
+    state.record_caption("Alice", "реплика на паузу")
+    # Not yet idle → nothing finalized.
+    state.tick_finalize(now=time.time())
+    assert _clean_entries(out) == []
+    # Past the pause window → finalized without an explicit leave.
+    state.tick_finalize(now=time.time() + _CAPTION_FINALIZE_PAUSE + 1)
+    entries = _clean_entries(out)
+    assert len(entries) == 1 and entries[0]["text"] == "реплика на паузу"
+
+
+def test_transcript_reader_exposes_clean_lines(tmp_path):
+    from plugins.google_meet import process_manager as pm
+
+    out = tmp_path / "m"
+    out.mkdir()
+    (out / "transcript_clean.jsonl").write_text(
+        '{"ts":"00:00:01","speaker":"Alice","text":"привет мир"}\n'
+        '{"ts":"00:00:05","speaker":"Bob","text":"как дела"}\n',
+        encoding="utf-8",
+    )
+    lines = pm._read_clean_lines(out, last=None)
+    assert lines == ["Alice: привет мир", "Bob: как дела"]
+    assert pm._read_clean_lines(out, last=1) == ["Bob: как дела"]
+
+
 def test_request_summary_writes_marker_when_attended(tmp_path):
     from plugins.google_meet.meet_bot import _BotState
 

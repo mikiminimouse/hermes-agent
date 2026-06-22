@@ -242,18 +242,48 @@ def status() -> Dict[str, Any]:
     }
 
 
+def _read_clean_lines(out_dir: Path, last: Optional[int]) -> list:
+    """Deduplicated, finalized utterances from transcript_clean.jsonl as
+    ``"Speaker: text"`` strings. This is what a realtime agent should read —
+    one line per completed utterance, no rolling partial/echo duplicates. Empty
+    list when the bot hasn't produced a clean stream yet (older runs / no
+    captions). Mirrors the raw ``lines`` shape so callers can swap easily."""
+    cp = out_dir / "transcript_clean.jsonl"
+    if not cp.is_file():
+        return []
+    out = []
+    for raw in cp.read_text(encoding="utf-8", errors="replace").splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            e = json.loads(raw)
+            sp = (e.get("speaker") or "").strip() or "Unknown"
+            tx = (e.get("text") or "").strip()
+            if tx:
+                out.append(f"{sp}: {tx}")
+        except Exception:
+            continue
+    return out[-last:] if last else out
+
+
 def transcript(last: Optional[int] = None) -> Dict[str, Any]:
-    """Read the current transcript file. Returns ok=False if none exists."""
+    """Read the current transcript. Returns raw rolling caption snapshots in
+    ``lines`` (good for the post-call collapse / debugging) AND deduplicated
+    finalized utterances in ``cleanLines`` (what a realtime agent should use)."""
     active = _read_active()
     if not active:
         return {"ok": False, "reason": "no active meeting"}
 
-    tp = Path(active.get("out_dir", "")) / "transcript.txt"
+    out_dir = Path(active.get("out_dir", ""))
+    tp = out_dir / "transcript.txt"
+    clean_lines = _read_clean_lines(out_dir, last)
     if not tp.is_file():
         return {
             "ok": True,
             "meetingId": active.get("meeting_id"),
             "lines": [],
+            "cleanLines": clean_lines,
             "total": 0,
             "path": str(tp),
         }
@@ -264,6 +294,7 @@ def transcript(last: Optional[int] = None) -> Dict[str, Any]:
         "ok": True,
         "meetingId": active.get("meeting_id"),
         "lines": lines,
+        "cleanLines": clean_lines,
         "total": len(all_lines),
         "path": str(tp),
     }

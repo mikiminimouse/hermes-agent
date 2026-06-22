@@ -82,6 +82,33 @@ def _meeting_id_from_url(url: str) -> str:
 # Status + transcript file writers
 # ---------------------------------------------------------------------------
 
+# Live caption dedup (Vexa-inspired). Google Meet emits a SINGLE caption row
+# per speaker that GROWS in place ("привет" -> "привет мир" -> ...), plus the
+# bot's own TTS gets re-transcribed as echo. The raw transcript.txt keeps every
+# growing snapshot (good for the post-call collapse + debugging), but a realtime
+# agent polling it drowns in near-duplicate partials. We additionally maintain a
+# per-speaker buffer that folds growth/refinement into ONE utterance and emits a
+# clean, finalized line to transcript_clean.jsonl when the speaker pauses,
+# diverges (new utterance), or the meeting ends. Mirrors Vexa's
+# normalize + prefix-confirmation + idle-finalization (see MEET_AGENT_RUNBOOK).
+_CAPTION_PUNCT_RE = re.compile(r"[^\w\s]", flags=re.UNICODE)
+_CAPTION_WS_RE = re.compile(r"\s+")
+# Seconds a speaker's caption can stay unchanged before we finalize the utterance
+# (Vexa idle-finalization; Meet has no is_final flag). Overridable for tests.
+_CAPTION_FINALIZE_PAUSE = 2.0
+
+
+def _norm_caption(text: str) -> str:
+    """Normalize a caption for growth/duplicate comparison ONLY (Vexa-style):
+    lowercase, drop punctuation, collapse whitespace. The original text is what
+    we store and emit — this is just the comparison key so "привет, мир." and
+    "привет мир" fold into one growing utterance."""
+    t = (text or "").strip().lower()
+    t = _CAPTION_PUNCT_RE.sub(" ", t)
+    t = _CAPTION_WS_RE.sub(" ", t)
+    return t.strip()
+
+
 class _BotState:
     """Single-process mutable state, flushed to ``status.json`` on each change."""
 
@@ -110,19 +137,29 @@ class _BotState:
         # Scraped captions, in order, deduped. Each entry is a dict of
         # {"ts": <epoch>, "speaker": str, "text": str}.
         self._seen: set = set()
+        # Live dedup buffers: speaker -> {"text","norm","started","updated"}.
+        # Folds growing/refining caption snapshots into one utterance; finalized
+        # utterances are appended (clean) to transcript_clean.jsonl.
+        self._live: dict = {}
         out_dir.mkdir(parents=True, exist_ok=True)
         self.transcript_path = out_dir / "transcript.txt"
+        self.clean_path = out_dir / "transcript_clean.jsonl"
         self.status_path = out_dir / "status.json"
         self._flush()
 
     # -------- transcript ------------------------------------------------
 
     def record_caption(self, speaker: str, text: str) -> None:
-        """Append a caption line if we haven't seen this exact (speaker, text)."""
+        """Record a caption snapshot. Appends the raw snapshot to transcript.txt
+        (exact-dup guarded, feeds the post-call collapse + debugging) AND folds
+        it into the per-speaker live buffer, which emits a clean finalized
+        utterance to transcript_clean.jsonl on pause / divergence / end."""
         speaker = (speaker or "").strip() or "Unknown"
         text = (text or "").strip()
         if not text:
             return
+        # Live dedup runs on every snapshot (also drives idle-finalization).
+        self._update_live(speaker, text)
         key = f"{speaker}|{text}"
         if key in self._seen:
             return
@@ -135,6 +172,59 @@ class _BotState:
         with self.transcript_path.open("a", encoding="utf-8") as f:
             f.write(line)
         self._flush()
+
+    # -------- live caption dedup (Vexa-inspired) -----------------------
+    def _update_live(self, speaker: str, text: str) -> None:
+        """Fold a growing/refining caption snapshot into the speaker's buffer."""
+        now = time.time()
+        norm = _norm_caption(text)
+        if not norm:
+            return
+        buf = self._live.get(speaker)
+        if buf is None:
+            self._live[speaker] = {"text": text, "norm": norm, "started": now, "updated": now}
+            return
+        bn = buf["norm"]
+        if norm == bn:
+            return  # identical snapshot — keep the idle timer at last real change
+        if norm.startswith(bn) or bn.startswith(norm):
+            # Growth or boundary-trim of the SAME utterance: keep longer text.
+            if len(norm) >= len(bn):
+                buf["text"], buf["norm"] = text, norm
+            buf["updated"] = now
+            return
+        # Diverged → new utterance from the same speaker: finalize old, restart.
+        self._finalize_speaker(speaker)
+        self._live[speaker] = {"text": text, "norm": norm, "started": now, "updated": now}
+
+    def _finalize_speaker(self, speaker: str) -> None:
+        buf = self._live.pop(speaker, None)
+        if not buf or not (buf.get("text") or "").strip():
+            return
+        entry = {
+            "ts": time.strftime("%H:%M:%S", time.localtime(buf["started"])),
+            "speaker": speaker,
+            "text": buf["text"].strip(),
+        }
+        try:
+            with self.clean_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
+
+    def tick_finalize(self, now: Optional[float] = None) -> None:
+        """Finalize any speaker whose caption has been static for the pause
+        window (Vexa idle-finalization — Meet has no is_final flag). Call this
+        periodically from the main loop so utterances close on natural pauses."""
+        ref = now if now is not None else time.time()
+        for speaker in list(self._live.keys()):
+            if ref - self._live[speaker]["updated"] >= _CAPTION_FINALIZE_PAUSE:
+                self._finalize_speaker(speaker)
+
+    def finalize_all(self) -> None:
+        """Flush all in-progress utterances (call at meeting teardown)."""
+        for speaker in list(self._live.keys()):
+            self._finalize_speaker(speaker)
 
     # -------- status file ----------------------------------------------
 
@@ -1115,6 +1205,10 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
                         last_audio_out_at=getattr(rt["session"], "last_audio_out_at", None),
                     )
 
+                # Close out any utterance that has paused, so the clean
+                # transcript (transcript_clean.jsonl) tracks the live dialogue.
+                state.tick_finalize(now)
+
                 time.sleep(1.0)
 
             # Try to leave cleanly — click the hangup button if present. Anchor
@@ -1165,6 +1259,9 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
                     rt["bridge"].teardown()
                 except Exception:
                     pass
+            # Flush any still-open utterance so transcript_clean.jsonl is
+            # complete before summarization / final reads.
+            state.finalize_all()
             # End-of-meeting summary signal. Only for graceful ends where the
             # bot actually attended (alone / duration / host-left / explicit
             # leave / page closed) — never for denied or lobby_timeout, which

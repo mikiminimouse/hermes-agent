@@ -229,6 +229,29 @@ def _update_marker(marker: Path, **fields) -> None:
     tmp.replace(marker)
 
 
+def _clean_transcript_text(meeting_dir: Path) -> str:
+    """Build a clean ``Speaker: text`` transcript from the bot's live-dedup
+    stream (transcript_clean.jsonl), one finalized utterance per line. Returns
+    "" when the file is absent/empty so the caller falls back to raw collapse."""
+    cp = meeting_dir / "transcript_clean.jsonl"
+    if not cp.is_file():
+        return ""
+    lines = []
+    for raw in cp.read_text(encoding="utf-8", errors="replace").splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            e = json.loads(raw)
+        except Exception:
+            continue
+        sp = (e.get("speaker") or "").strip() or "Unknown"
+        tx = (e.get("text") or "").strip()
+        if tx:
+            lines.append(f"{sp}: {tx}")
+    return "\n".join(lines)
+
+
 def summarize(meeting_dir: Path) -> int:
     transcript = meeting_dir / "transcript.txt"
     report = meeting_dir / "report.md"
@@ -242,11 +265,21 @@ def summarize(meeting_dir: Path) -> int:
     meeting_id = meeting_dir.name
     prompt = _METHODOLOGY.replace("<id>", meeting_id)
     raw = transcript.read_text(encoding="utf-8")
-    transcript_text = collapse_transcript(raw)
-    if not transcript_text.strip():
-        transcript_text = raw  # nothing parsed — fall back to raw
-    print(f"[meet_summarize] collapsed {len(raw)} -> {len(transcript_text)} bytes",
-          file=sys.stderr)
+    # Prefer the bot's live-deduplicated stream (transcript_clean.jsonl): it is
+    # already one finalized utterance per line, so we skip the lossy rolling-
+    # caption collapse. Fall back to collapsing the raw transcript for older
+    # runs / when the clean stream is absent or empty.
+    clean = _clean_transcript_text(meeting_dir)
+    if clean.strip():
+        transcript_text = clean
+        print(f"[meet_summarize] using clean stream: {len(raw)} raw -> "
+              f"{len(transcript_text)} bytes", file=sys.stderr)
+    else:
+        transcript_text = collapse_transcript(raw)
+        if not transcript_text.strip():
+            transcript_text = raw  # nothing parsed — fall back to raw
+        print(f"[meet_summarize] collapsed {len(raw)} -> {len(transcript_text)} bytes",
+              file=sys.stderr)
     # Safety ceiling: keep the TAIL (most recent turns) if still oversized, so a
     # pathological transcript can't overflow the model context.
     max_chars = int(os.environ.get("HERMES_MEET_SUMMARY_MAX_CHARS", "200000"))
