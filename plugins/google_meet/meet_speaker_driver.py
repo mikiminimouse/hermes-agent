@@ -26,6 +26,7 @@ import os
 import re
 import sys
 import time
+import difflib
 import threading
 import subprocess
 
@@ -43,10 +44,20 @@ from plugins.google_meet.meet_bot import _is_farewell_candidate  # noqa: E402
 from agent.auxiliary_client import call_llm  # noqa: E402
 from agent.plugin_llm import _extract_text  # noqa: E402
 
-# Wake-word: the bot only responds when explicitly addressed by name (ASR-tolerant
-# variants of "Вертер"/"Verter"). Greeting on join and goodbye on close are the
-# only exceptions — everything else is SKIP unless the bot is named.
-_WAKE = re.compile(r"в[еэ]рт[еёэ]?р|verter|вэрт", re.IGNORECASE)
+# Address detection: the bot responds only when called by name. Russian ASR
+# routinely mangles "Вертер" (heard "ветра", "ветер", "вертел"…), so we fuzzy-match
+# each word against "вертер" (ratio>=0.72 catches those manglings; common words
+# score <=0.55). The strict LLM prompt is the second filter — if a near-miss like
+# "ветер" (wind) wasn't really an address, the model returns SKIP. Greeting on
+# join and goodbye on close are the only unprompted lines.
+def _addressed(text: str) -> bool:
+    t = (text or "").lower()
+    if "verter" in t or "вертер" in t or "вэртер" in t:
+        return True
+    for w in re.findall(r"[а-яёa-z]{4,9}", t):
+        if difflib.SequenceMatcher(None, w, "вертер").ratio() >= 0.72:
+            return True
+    return False
 
 MODEL = os.environ.get("DRIVER_MODEL", "gpt-5.5")
 PROVIDER = os.environ.get("DRIVER_PROVIDER", "openai-codex")
@@ -195,10 +206,17 @@ def main(argv) -> int:
             return 1
         time.sleep(2)
 
-    # 2) Greet once.
+    # 2) Greet once. The realtime session can report ready a beat before Silero
+    # finishes loading, so the first greeting may produce no audio — re-say it
+    # once if audioBytesOut hasn't moved.
     st = pm.status()
-    _say(_greeting(st))
+    greeting = _greeting(st)
+    _say(greeting)
     _log(out_dir, "greeted")
+    time.sleep(6)
+    if not (pm.status().get("audioBytesOut") or 0):
+        _say(greeting)
+        _log(out_dir, "re-greeted (first produced no audio)")
 
     # 3) Conversation loop — deterministic cadence, point-wise LLM calls.
     cursor = -1
@@ -222,7 +240,7 @@ def main(argv) -> int:
             if _is_self(speaker):
                 continue          # ignore our own TTS echo
             convo.append(line)
-            if _WAKE.search(text):        # bot addressed by name / wake-word
+            if _addressed(text):          # bot called by name (ASR-fuzzy)
                 addressed = True
             if _is_farewell_candidate(text):
                 closing = True
