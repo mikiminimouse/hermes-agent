@@ -26,6 +26,7 @@ import os
 import sys
 import time
 import threading
+import subprocess
 
 _REPO = "/home/vitaly/.hermes/hermes-agent"
 if _REPO not in sys.path:
@@ -45,7 +46,11 @@ PROVIDER = os.environ.get("DRIVER_PROVIDER", "openai-codex")
 GUEST = os.environ.get("HERMES_MEET_GUEST_NAME", "Verter Multitender")
 POLL_SEC = float(os.environ.get("DRIVER_POLL_SEC", "2.5"))
 MAX_CTX_LINES = 24            # rolling dialogue context fed to the LLM
-HEAVY_TIMEOUT = float(os.environ.get("DRIVER_HEAVY_TIMEOUT", "600"))
+HEAVY_TIMEOUT = float(os.environ.get("DRIVER_HEAVY_TIMEOUT", "900"))
+# PATH for the background tool-capable agent (hermes CLI + nvm node for codex).
+_HERMES_BIN = os.environ.get(
+    "DRIVER_HERMES_BIN",
+    "/home/vitaly/.local/bin:/home/vitaly/.nvm/versions/node/v24.13.1/bin")
 
 _SYS = (
     "Ты — Verter, голосовой ассистент на Google Meet созвоне. Отвечай по-русски, "
@@ -108,20 +113,45 @@ def _greeting(status) -> str:
 
 
 def _run_heavy(task: str, context: str, out_dir) -> None:
-    _log(out_dir, f"HEAVY start: {task[:80]}")
-    msgs = [
-        {"role": "system", "content": (
-            "Ты — Verter, выполняешь задачу с созвона в фоне. Верни КРАТКИЙ "
-            "результат (2-5 предложений) для зачитывания вслух, по-русски, без "
-            "разметки.")},
-        {"role": "user", "content": f"Задача: {task}\n\nКонтекст созвона:\n{context}"},
-    ]
-    out = _llm(msgs, timeout=HEAVY_TIMEOUT)
-    if out.startswith("__ERR__") or not out:
+    """Run a heavy task in the background with a TOOL-CAPABLE agent (hermes -z:
+    web search, files, shell, skills) so it actually DOES the work, not just
+    reasons. Slow (full agent), but it's off the dialogue path; the result is
+    spoken when ready. Falls back to a plain LLM call if the CLI is unavailable."""
+    _log(out_dir, f"HEAVY start (agent): {task[:80]}")
+    prompt = (
+        "Ты — Verter, выполняешь задачу, поставленную на голосовом созвоне. "
+        "У тебя ЕСТЬ инструменты (поиск в сети, чтение файлов, выполнение команд, "
+        "навыки) — ИСПОЛЬЗУЙ их, чтобы реально выполнить задачу, а не просто "
+        "рассуждать о ней.\n\n"
+        f"Задача: {task}\n\nКонтекст созвона (последние реплики):\n{context}\n\n"
+        "В КОНЦЕ верни краткий результат (2-5 предложений) для зачитывания вслух "
+        "по-русски, без разметки и ссылок."
+    )
+    out = ""
+    try:
+        env = dict(os.environ)
+        env["PATH"] = _HERMES_BIN + ":" + env.get("PATH", "")
+        r = subprocess.run(
+            ["hermes", "-z", prompt, "-m", MODEL, "--profile", "verter", "--yolo"],
+            capture_output=True, text=True, timeout=HEAVY_TIMEOUT, env=env)
+        out = (r.stdout or "").strip()
+        if not out:
+            _log(out_dir, f"HEAVY agent empty; stderr={r.stderr[-200:] if r.stderr else ''}")
+    except subprocess.TimeoutExpired:
+        _log(out_dir, "HEAVY agent timeout")
+    except FileNotFoundError:
+        # No hermes CLI on PATH — degrade to an LLM-only answer.
+        out = _llm([
+            {"role": "system", "content": "Ты Verter. Кратко, по-русски, для речи."},
+            {"role": "user", "content": f"Задача: {task}\nКонтекст:\n{context}"},
+        ], timeout=HEAVY_TIMEOUT)
+        if out.startswith("__ERR__"):
+            out = ""
+    if not out:
         _say(f"Не получилось доделать задачу: {task[:60]}.")
-        _log(out_dir, f"HEAVY fail: {out[:120]}")
+        _log(out_dir, "HEAVY fail")
         return
-    _say("По задаче готово. " + out)
+    _say("По задаче готово. " + out[:700])
     _log(out_dir, f"HEAVY done: {out[:120]}")
 
 
