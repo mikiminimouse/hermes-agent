@@ -75,9 +75,11 @@ MODEL = os.environ.get("DRIVER_MODEL", "gpt-5.5")
 PROVIDER = os.environ.get("DRIVER_PROVIDER", "openai-codex")
 GUEST = os.environ.get("HERMES_MEET_GUEST_NAME", "Verter Multitender")
 
-# Loop cadence: how often we poll status()/transcript(). 2.5s balances
-# responsiveness vs. status() churn; below ~1s adds load with no perceptible gain.
-POLL_SEC = _envf("DRIVER_POLL_SEC", 2.5, 0.5, 30)
+# Loop cadence: how often we poll status()/transcript(). 1.2s keeps perceived
+# latency low (was 2.5s, which added up to ~1.3s before a finalized line was even
+# seen) while status()/transcript() reads stay cheap; below ~0.8s adds load with
+# no perceptible gain.
+POLL_SEC = _envf("DRIVER_POLL_SEC", 1.2, 0.5, 30)
 MAX_CTX_LINES = _envi("DRIVER_MAX_CTX_LINES", 24, 4, 200)  # dialogue lines → LLM
 
 # Address fuzzy-match ratio: a word must START like the name (вер/вэр/вёр) AND
@@ -349,6 +351,7 @@ def main(argv) -> int:
     recent_replies: list = []   # norms of the last REPLY_DEDUP_KEEP replies
     last_human_at = time.time()   # presence signal: when a human last spoke
     had_human = False
+    llm_err_streak = 0          # consecutive LLM failures → circuit-breaker
     while True:
         st = pm.status()
         if st.get("exited") or st.get("leaveReason"):
@@ -393,35 +396,49 @@ def main(argv) -> int:
         # Normal turns: respond ONLY when explicitly addressed (by name / wake).
         elif addressed:
             addressed = False
+            _t_llm0 = time.time()
             reply = _llm([
                 {"role": "system", "content": _SYS},
                 {"role": "user", "content": (
                     "Диалог на созвоне (последние реплики):\n"
                     + "\n".join(convo) + "\n\nК тебе обратились. Твой ход:")},
             ], timeout=60)
+            _llm_dt = time.time() - _t_llm0
             if reply.startswith("__ERR__"):
-                _log(out_dir, f"llm err: {reply[:120]}")
-            elif reply.strip().upper() == "SKIP":
-                _log(out_dir, "skip (not really for me)")
-            elif reply.strip().startswith("[DELEGATE]"):
-                task = reply.split("]", 1)[1].strip() if "]" in reply else reply
-                msg = _try_delegate(task, "\n".join(convo), out_dir)
-                _say(msg)
-                _log(out_dir, f"delegate→ {msg[:32]} | {task[:60]}")
+                # Circuit-breaker: one transient error → stay quiet (likely a
+                # blip). Two+ in a row (e.g. codex rate-limit) means the bot would
+                # be silently mute on every address and look dead — voice a short
+                # fallback ONCE so the human gets feedback, then go quiet again.
+                # NB: do NOT `continue` here — that would skip the sleep below and
+                # busy-loop the LLM during a rate-limit. Fall through to the sleep.
+                llm_err_streak += 1
+                _log(out_dir, f"llm err ({llm_err_streak}) in {_llm_dt:.1f}s: {reply[:120]}")
+                if llm_err_streak == 2:
+                    _say("Извините, сейчас не могу ответить — давайте чуть позже.")
             else:
-                # Reply-dedup against ONLY the last REPLY_DEDUP_KEEP replies (not
-                # a time window) so a back-to-back A/B/A repeat is caught but a
-                # genuine re-ask after a few turns is treated as fresh.
-                rnorm = _norm_task(reply)
-                dup = any(difflib.SequenceMatcher(None, rnorm, t).ratio() >= REPLY_DEDUP_RATIO
-                          for t in recent_replies)
-                if dup:
-                    _log(out_dir, "skip dup reply")
+                llm_err_streak = 0   # any real LLM response resets the breaker
+                if reply.strip().upper() == "SKIP":
+                    _log(out_dir, f"skip (not really for me) [llm {_llm_dt:.1f}s]")
+                elif reply.strip().startswith("[DELEGATE]"):
+                    task = reply.split("]", 1)[1].strip() if "]" in reply else reply
+                    msg = _try_delegate(task, "\n".join(convo), out_dir)
+                    _say(msg)
+                    _log(out_dir, f"delegate→ {msg[:32]} | {task[:60]}")
                 else:
-                    _say(reply)
-                    recent_replies.append(rnorm)
-                    del recent_replies[:-REPLY_DEDUP_KEEP]
-                    _log(out_dir, f"said: {reply[:80]}")
+                    # Reply-dedup against ONLY the last REPLY_DEDUP_KEEP replies
+                    # (not a time window) so a back-to-back A/B/A repeat is caught
+                    # but a genuine re-ask after a few turns is treated as fresh.
+                    rnorm = _norm_task(reply)
+                    dup = any(difflib.SequenceMatcher(None, rnorm, t).ratio() >= REPLY_DEDUP_RATIO
+                              for t in recent_replies)
+                    if dup:
+                        _log(out_dir, f"skip dup reply [llm {_llm_dt:.1f}s]")
+                    else:
+                        _t_say0 = time.time()
+                        _say(reply)
+                        recent_replies.append(rnorm)
+                        del recent_replies[:-REPLY_DEDUP_KEEP]
+                        _log(out_dir, f"said [llm {_llm_dt:.1f}s say {time.time()-_t_say0:.1f}s]: {reply[:80]}")
 
         # End the meeting from the DIALOGUE (no reliance on participantCount):
         # a farewell happened and the humans have gone quiet, or nobody has
