@@ -124,7 +124,9 @@ _SYS = (
     "тему просто обсуждают или уже просили это же — тогда обычный ответ или SKIP.\n"
     "- К тебе обратились с обычным вопросом/репликой → дай короткий живой устный "
     "ответ.\n"
-    "Никогда не описывай свои действия, просто говори как человек."
+    "Никогда не описывай свои действия и НЕ оправдывайся (не говори «я молчал, "
+    "потому что…», «не поздоровался, потому что…») — просто отвечай по сути, "
+    "по-разному, не повторяй одну и ту же фразу."
 )
 
 
@@ -262,6 +264,7 @@ def main(argv) -> int:
     convo: list = []          # rolling "Speaker: text" of the whole dialogue
     addressed = False         # bot was explicitly addressed in the new lines
     farewelled = False        # we've already said our goodbye
+    last_reply = {"text": "", "at": 0.0}   # for reply-dedup (don't repeat verbatim)
     while True:
         st = pm.status()
         if st.get("exited") or st.get("leaveReason"):
@@ -319,8 +322,17 @@ def main(argv) -> int:
                 _say(msg)
                 _log(out_dir, f"delegate→ {msg[:32]} | {task[:60]}")
             else:
-                _say(reply)
-                _log(out_dir, f"said: {reply[:80]}")
+                # Reply-dedup: don't repeat a near-identical line within ~45s
+                # (avoids "Да, я на связи" said a dozen times to repeated pings).
+                now2 = time.time()
+                if (difflib.SequenceMatcher(
+                        None, _norm_task(reply), _norm_task(last_reply["text"])
+                    ).ratio() >= 0.8 and (now2 - last_reply["at"]) < 45):
+                    _log(out_dir, "skip dup reply")
+                else:
+                    _say(reply)
+                    last_reply = {"text": reply, "at": now2}
+                    _log(out_dir, f"said: {reply[:80]}")
 
         time.sleep(POLL_SEC)
 
