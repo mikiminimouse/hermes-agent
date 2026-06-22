@@ -276,6 +276,63 @@ def test_live_dedup_suppresses_rescroll_duplicate(tmp_path):
     assert len(_clean_entries(out)) == 2
 
 
+def test_dedup_suppresses_old_scroll_rerender_beyond_recent_window(tmp_path):
+    """Root-cause guard: Meet re-renders an OLD closed turn far beyond the recent
+    window (it scrolled back into view). Without the full seen-set it re-emits and
+    re-triggers the driver's address-gate -> bot 'loops'. Must be suppressed."""
+    from plugins.google_meet.meet_bot import _BotState
+
+    out = tmp_path / "s"
+    state = _BotState(out_dir=out, meeting_id="x-y-z",
+                      url="https://meet.google.com/x-y-z")
+    state.record_caption("Alice", "Вертер слышишь меня")
+    state.finalize_all()                       # emits #0 (the addressed turn)
+    # Many distinct later turns push #0 out of the recent (last-8) window.
+    for i in range(12):
+        state.record_caption("Alice", f"совершенно отдельная реплика номер {i}")
+        state.finalize_all()
+    n_before = len(_clean_entries(out))
+    # Meet scrolls and re-renders the OLD "Вертер слышишь" line — no new entry.
+    state.record_caption("Alice", "Вертер слышишь меня")
+    state.finalize_all()
+    assert len(_clean_entries(out)) == n_before
+
+
+def test_live_dedup_merges_sliding_tail_overlap(tmp_path):
+    from plugins.google_meet.meet_bot import _BotState
+
+    out = tmp_path / "s"
+    state = _BotState(out_dir=out, meeting_id="x-y-z",
+                      url="https://meet.google.com/x-y-z")
+    # Meet can slide a caption row forward instead of emitting a pure prefix
+    # growth: "A B C D" -> "C D E F". This is still one utterance.
+    state.record_caption("Alice", "раз два три четыре")
+    state.record_caption("Alice", "три четыре пять шесть")
+    state.finalize_all()
+    entries = _clean_entries(out)
+    assert len(entries) == 1
+    assert entries[0]["text"] == "раз два три четыре пять шесть"
+
+
+def test_live_dedup_rewrites_late_extension_instead_of_duplicate(tmp_path):
+    import time
+    from plugins.google_meet.meet_bot import _BotState, _CAPTION_FINALIZE_PAUSE
+
+    out = tmp_path / "s"
+    state = _BotState(out_dir=out, meeting_id="x-y-z",
+                      url="https://meet.google.com/x-y-z")
+    state.record_caption("Alice", "проверь архитектуру дедупликации")
+    state.tick_finalize(now=time.time() + _CAPTION_FINALIZE_PAUSE + 0.1)
+    # Late refinement of the same already-finalized turn must update the clean
+    # entry, not create a second repeated line for the realtime driver.
+    state.record_caption("Alice", "проверь архитектуру дедупликации и склейки обрывков")
+    state.finalize_all()
+    entries = _clean_entries(out)
+    assert len(entries) == 1
+    assert entries[0]["id"] == 0
+    assert entries[0]["text"] == "проверь архитектуру дедупликации и склейки обрывков"
+
+
 def test_farewell_candidate_high_precision(tmp_path):
     from plugins.google_meet.meet_bot import _is_farewell_candidate
     # Positives — RU + EN closings.

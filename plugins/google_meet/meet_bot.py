@@ -98,6 +98,32 @@ _CAPTION_WS_RE = re.compile(r"\s+")
 _CAPTION_FINALIZE_PAUSE = 2.0
 
 
+def _caption_norm_words(text: str) -> list[str]:
+    return _norm_caption(text).split()
+
+
+def _merge_caption_tail_overlap(previous: str, current: str) -> Optional[str]:
+    """Merge two snapshots when Meet slid the caption window forward.
+
+    Besides pure prefix growth (``A B`` → ``A B C``), Meet can re-render a
+    same utterance as an overlapping tail/head window (``A B C D`` → ``C D E``).
+    Treat a 2+ word suffix/prefix overlap as one continued utterance and append
+    only the new tail, preserving the original text as much as possible.
+    """
+    prev_words = _caption_norm_words(previous)
+    cur_words = _caption_norm_words(current)
+    if len(prev_words) < 2 or len(cur_words) < 2:
+        return None
+    max_k = min(len(prev_words), len(cur_words))
+    for k in range(max_k, 1, -1):
+        if prev_words[-k:] == cur_words[:k]:
+            raw_tail = (current or "").strip().split()[k:]
+            if not raw_tail:
+                return previous
+            return f"{previous.rstrip()} {' '.join(raw_tail)}".strip()
+    return None
+
+
 def _norm_caption(text: str) -> str:
     """Normalize a caption for growth/duplicate comparison ONLY (Vexa-style):
     lowercase, drop punctuation, collapse whitespace. The original text is what
@@ -170,9 +196,13 @@ class _BotState:
         # Folds growing/refining caption snapshots into one utterance; finalized
         # utterances are appended (clean) to transcript_clean.jsonl.
         self._live: dict = {}
-        # Recent finalized norm-texts per speaker (last few) — suppresses the
-        # SAME utterance being re-finalized when Meet scrolls its 2-line caption
-        # window and re-renders an already-closed turn.
+        # Dedup of finalized utterances. `_seen_final` is the set of ALL
+        # normalized turns ever emitted per speaker → O(1) exact-match guard that
+        # kills re-finalization when Meet scrolls its 2-line caption window and
+        # re-renders an OLD row (a 9-min call made 10609 lines for 235 uniques
+        # with the previous last-6 window). `_recent_final` (last few) additionally
+        # catches partial fragments of a still-recent turn.
+        self._seen_final: dict = {}
         self._recent_final: dict = {}
         out_dir.mkdir(parents=True, exist_ok=True)
         self.transcript_path = out_dir / "transcript.txt"
@@ -262,6 +292,11 @@ class _BotState:
                 buf["text"], buf["norm"] = text, norm
             buf["updated"] = now
             return
+        merged = _merge_caption_tail_overlap(buf.get("text", ""), text)
+        if merged:
+            buf["text"], buf["norm"] = merged, _norm_caption(merged)
+            buf["updated"] = now
+            return
         # Diverged → new utterance from the same speaker: finalize old, restart.
         self._finalize_speaker(speaker)
         self._live[speaker] = {"text": text, "norm": norm, "started": now, "updated": now}
@@ -272,12 +307,30 @@ class _BotState:
             return
         text = buf["text"].strip()
         norm = buf.get("norm") or _norm_caption(text)
-        # Suppress re-finalization of the SAME turn (or a fragment of one) from
-        # this speaker: Meet scrolls a 2-line caption window and re-renders
-        # already-closed turns, which would otherwise duplicate clean lines.
         recent = self._recent_final.get(speaker, [])
+        seen = self._seen_final.setdefault(speaker, set())
+        # ROOT FIX for re-finalization: Meet scrolls its 2-line caption window
+        # and re-renders OLD already-closed turns far beyond the recent window —
+        # e.g. an old "Вертер, слышишь?" scrolls back into view and gets
+        # finalized again with a new id, which then re-triggers the driver's
+        # address-gate and makes the bot re-answer ("looping"). Suppress against
+        # the set of ALL turns ever emitted for this speaker, not just the last
+        # few. (A 9-min call produced 10609 lines for 235 uniques otherwise.)
+        if norm in seen:
+            return
         for r in recent:
-            if norm == r or (norm and norm in r):
+            r_norm = r.get("norm", "") if isinstance(r, dict) else str(r)
+            r_id = r.get("id") if isinstance(r, dict) else None
+            if norm and norm in r_norm:
+                return  # a fragment of a still-recent turn
+            if r_norm and r_norm in norm:
+                # A late Meet refinement extended an utterance we already
+                # finalized. Update that JSONL entry in place (same id/cursor)
+                # instead of emitting a duplicate clean turn.
+                if isinstance(r_id, int) and self._rewrite_clean_entry(r_id, text):
+                    r["norm"] = norm
+                    r["text"] = text
+                    seen.add(norm)
                 return
         entry = {
             "id": self._finalize_counter,
@@ -286,9 +339,14 @@ class _BotState:
             "text": text,
         }
         self._finalize_counter += 1
-        # Remember this finalized turn (keep the last few per speaker).
-        recent.append(norm)
-        self._recent_final[speaker] = recent[-6:]
+        # Remember this finalized turn: full set for exact-match (scroll re-render)
+        # + a short recent list for prefix/fragment folding. Cap the set so a
+        # multi-hour call can't grow it without bound.
+        seen.add(norm)
+        if len(seen) > 3000:
+            seen.clear()
+        recent.append({"norm": norm, "id": entry["id"], "text": text})
+        self._recent_final[speaker] = recent[-8:]
         is_human = _looks_like_human_speaker(speaker, getattr(self, "guest_name", ""))
         # Track human speakers for greeting / presence (best-effort; the People
         # panel is unreliable, but whoever actually spoke is a real participant).
@@ -309,6 +367,39 @@ class _BotState:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         except OSError:
             pass
+
+    def _rewrite_clean_entry(self, entry_id: int, text: str) -> bool:
+        """Replace a finalized clean entry with a late longer refinement.
+
+        Keeps the same monotonic id so cursor-based readers do not see a second
+        duplicate turn, while post-call summarization receives the most complete
+        text available.
+        """
+        try:
+            if not self.clean_path.is_file():
+                return False
+            rows = []
+            changed = False
+            for raw in self.clean_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                if not raw.strip():
+                    continue
+                try:
+                    item = json.loads(raw)
+                except Exception:
+                    rows.append(raw)
+                    continue
+                if int(item.get("id", -1)) == entry_id:
+                    item["text"] = text
+                    changed = True
+                rows.append(json.dumps(item, ensure_ascii=False))
+            if not changed:
+                return False
+            tmp = self.clean_path.with_suffix(".jsonl.tmp")
+            tmp.write_text("\n".join(rows) + "\n", encoding="utf-8")
+            tmp.replace(self.clean_path)
+            return True
+        except Exception:
+            return False
 
     def tick_finalize(self, now: Optional[float] = None) -> None:
         """Finalize any speaker whose caption has been static for the pause
