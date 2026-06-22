@@ -54,8 +54,12 @@ def _addressed(text: str) -> bool:
     t = (text or "").lower()
     if "verter" in t or "вертер" in t or "вэртер" in t:
         return True
-    for w in re.findall(r"[а-яёa-z]{4,9}", t):
-        if difflib.SequenceMatcher(None, w, "вертер").ratio() >= 0.72:
+    for w in re.findall(r"[а-яёa-z]{5,9}", t):
+        # Must START like the name (вер/вэр/вёр). Weather words "ветер"/"ветра"
+        # begin with "вет-" and otherwise fuzzy-matched at ~0.9, making the bot
+        # barge in (review blocker). Clean "вертер"/"verter" already caught above.
+        if w[:3] in ("вер", "вэр", "вёр") and \
+                difflib.SequenceMatcher(None, w, "вертер").ratio() >= 0.8:
             return True
     return False
 
@@ -298,6 +302,7 @@ def main(argv) -> int:
         if isinstance(tr.get("maxCleanId"), int) and tr["maxCleanId"] >= 0:
             cursor = tr["maxCleanId"]
         closing = False
+        addressed = False   # per-batch: reset every tick so it never lingers
         for line in new:
             speaker = line.split(":", 1)[0].strip() if ":" in line else ""
             text = line.split(":", 1)[1].strip() if ":" in line else line

@@ -144,11 +144,8 @@ _FAREWELL_RE = re.compile(
     r"встреча (окончен|завершен|законч|подошла к концу)|"
     r"на этом (всё|все|закончим|завершаем|заканчива)|"
     r"(будем|давайте|давай) (заканчива|завершать)|заканчива(ем|ю) (встречу|созвон|совещание)|"
-    r"спасибо (всем )?за (встречу|участие|внимание|созвон)|"
-    r"хорошего (дня|вечера)|всем хорошего|"
-    r"good ?bye|\bbye\b|see you|talk (to you )?later|"
-    r"that s (all|it)( for)?|wrap (it |this )?up|"
-    r"thanks (everyone|you all|all)|have a (good|great) (day|one|evening)|"
+    r"good ?bye|see you|talk (to you )?later|"
+    r"that s all for|wrap (it |this )?up|"
     r"end (the )?(call|meeting))",
     flags=re.IGNORECASE,
 )

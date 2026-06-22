@@ -335,14 +335,16 @@ def test_live_dedup_rewrites_late_extension_instead_of_duplicate(tmp_path):
 
 def test_farewell_candidate_high_precision(tmp_path):
     from plugins.google_meet.meet_bot import _is_farewell_candidate
-    # Positives — RU + EN closings.
+    # Positives — only unambiguously TERMINAL closings.
     for t in ["Всем спасибо, до свидания!", "Давайте заканчивать встречу",
-              "На этом всё, хорошего дня", "Ок, see you later", "Let's wrap up",
-              "thanks everyone, bye"]:
+              "На этом всё, расходимся", "Ок, see you later", "Let's wrap up",
+              "пора заканчивать созвон"]:
         assert _is_farewell_candidate(t), t
-    # Negatives — mid-meeting phrases that must NOT misfire.
+    # Negatives — polite mid-meeting formulas must NOT count as a farewell
+    # (these used to false-fire and could end a live meeting — review blocker F2).
     for t in ["Спасибо за апдейт", "Давайте к следующему пункту",
-              "thanks for that info", "продолжаем работать", "это всё по дизайну"]:
+              "thanks for that info", "продолжаем работать", "это всё по дизайну",
+              "спасибо за внимание", "хорошего дня всем", "thanks everyone"]:
         assert not _is_farewell_candidate(t), t
 
 
