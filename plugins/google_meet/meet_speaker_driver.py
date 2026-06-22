@@ -65,10 +65,48 @@ GUEST = os.environ.get("HERMES_MEET_GUEST_NAME", "Verter Multitender")
 POLL_SEC = float(os.environ.get("DRIVER_POLL_SEC", "2.5"))
 MAX_CTX_LINES = 24            # rolling dialogue context fed to the LLM
 HEAVY_TIMEOUT = float(os.environ.get("DRIVER_HEAVY_TIMEOUT", "900"))
+MAX_HEAVY = int(os.environ.get("DRIVER_MAX_HEAVY", "1"))  # concurrent bg agents
 # PATH for the background tool-capable agent (hermes CLI + nvm node for codex).
 _HERMES_BIN = os.environ.get(
     "DRIVER_HERMES_BIN",
     "/home/vitaly/.local/bin:/home/vitaly/.nvm/versions/node/v24.13.1/bin")
+
+# Background-task throttle: ONE tool-capable agent at a time + dedup of
+# near-identical tasks, so a topic discussed repeatedly (with the bot named) does
+# NOT spawn a swarm of hermes -z agents (live test spawned 13 in 2 min).
+_heavy_lock = threading.Lock()
+_heavy_active = 0
+_recent_tasks: list = []
+
+
+def _norm_task(t: str) -> str:
+    return re.sub(r"[^\w\s]", " ", (t or "").lower())
+
+
+def _try_delegate(task: str, context: str, out_dir) -> str:
+    """Spawn a background tool-capable agent for *task* unless one is already
+    running or the task duplicates a recent one. Returns the line to speak."""
+    global _heavy_active
+    nt = _norm_task(task)
+    with _heavy_lock:
+        for prev in _recent_tasks[-6:]:
+            if difflib.SequenceMatcher(None, nt, prev).ratio() >= 0.6:
+                return "Эту задачу я уже взял в работу — скоро вернусь с результатом."
+        if _heavy_active >= MAX_HEAVY:
+            return "Я ещё занят предыдущей задачей — доделаю её и сразу возьму эту."
+        _heavy_active += 1
+        _recent_tasks.append(nt)
+
+    def _worker():
+        global _heavy_active
+        try:
+            _run_heavy(task, context, out_dir)
+        finally:
+            with _heavy_lock:
+                _heavy_active -= 1
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return f"Принял — делаю: {task}. Вернусь с результатом."
 
 _SYS = (
     "Ты — Verter, голосовой ассистент на Google Meet созвоне. Отвечай по-русски, "
@@ -80,9 +118,10 @@ _SYS = (
     "что-то НЕ обращаясь к тебе — ты МОЛЧИШЬ.\n"
     "Реши по последней реплике:\n"
     "- Обращения к тебе нет / это разговор людей между собой → ответь РОВНО: SKIP\n"
-    "- К тебе обратились с тяжёлой задачей (поиск, расчёт, анализ, проверить "
-    "что-то, написать код/документ) → ответь РОВНО одной строкой: "
-    "[DELEGATE] <короткое описание задачи своими словами>\n"
+    "- Тебя ЯВНО попросили ВЫПОЛНИТЬ конкретное тяжёлое действие (найди, проверь, "
+    "посчитай, настрой, напиши код/документ) → ответь РОВНО одной строкой: "
+    "[DELEGATE] <короткое описание задачи своими словами>. НЕ делегируй, если "
+    "тему просто обсуждают или уже просили это же — тогда обычный ответ или SKIP.\n"
     "- К тебе обратились с обычным вопросом/репликой → дай короткий живой устный "
     "ответ.\n"
     "Никогда не описывай свои действия, просто говори как человек."
@@ -276,11 +315,9 @@ def main(argv) -> int:
                 _log(out_dir, "skip (not really for me)")
             elif reply.strip().startswith("[DELEGATE]"):
                 task = reply.split("]", 1)[1].strip() if "]" in reply else reply
-                _say(f"Принял — делаю: {task}. Вернусь с результатом.")
-                threading.Thread(target=_run_heavy,
-                                 args=(task, "\n".join(convo), out_dir),
-                                 daemon=True).start()
-                _log(out_dir, f"delegated: {task[:80]}")
+                msg = _try_delegate(task, "\n".join(convo), out_dir)
+                _say(msg)
+                _log(out_dir, f"delegate→ {msg[:32]} | {task[:60]}")
             else:
                 _say(reply)
                 _log(out_dir, f"said: {reply[:80]}")
