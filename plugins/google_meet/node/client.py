@@ -94,10 +94,13 @@ class NodeClient:
     def status(self) -> Dict[str, Any]:
         return self._rpc("status", {})
 
-    def transcript(self, last: Optional[int] = None) -> Dict[str, Any]:
+    def transcript(self, last: Optional[int] = None,
+                   since_id: Optional[int] = None) -> Dict[str, Any]:
         payload: Dict[str, Any] = {}
         if last is not None:
             payload["last"] = int(last)
+        if since_id is not None:
+            payload["since_id"] = int(since_id)
         return self._rpc("transcript", payload)
 
     def say(self, text: str) -> Dict[str, Any]:

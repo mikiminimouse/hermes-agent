@@ -124,7 +124,9 @@ def start(
 
     # Wipe any stale transcript/status files from a previous run of this
     # meeting id so polling isn't confused.
-    for name in ("transcript.txt", "status.json"):
+    for name in ("transcript.txt", "status.json", "transcript_clean.jsonl",
+                 "say_queue.jsonl", "summary_request.json", "report.md",
+                 "admission_debug.json", "meeting_closing.json"):
         f = out / name
         if f.exists():
             try:
@@ -242,62 +244,76 @@ def status() -> Dict[str, Any]:
     }
 
 
-def _read_clean_lines(out_dir: Path, last: Optional[int]) -> list:
+def _read_clean_lines(out_dir: Path, last: Optional[int],
+                      since_id: Optional[int] = None) -> tuple:
     """Deduplicated, finalized utterances from transcript_clean.jsonl as
-    ``"Speaker: text"`` strings. This is what a realtime agent should read —
-    one line per completed utterance, no rolling partial/echo duplicates. Empty
-    list when the bot hasn't produced a clean stream yet (older runs / no
-    captions). Mirrors the raw ``lines`` shape so callers can swap easily."""
+    ``"Speaker: text"`` strings — one line per completed utterance, no rolling
+    partial/echo duplicates. This is what a realtime agent should read.
+
+    Returns ``(lines, ids, max_id)``. When ``since_id`` is given, only utterances
+    with ``id > since_id`` are returned — a monotonic cursor so the agent reads
+    each finalized turn EXACTLY once and never misses one. ``max_id`` is the
+    highest id present in the file (-1 = none), so the caller advances its cursor
+    even when the incremental slice is empty."""
     cp = out_dir / "transcript_clean.jsonl"
     if not cp.is_file():
-        return []
-    out = []
+        return [], [], -1
+    lines: list = []
+    ids: list = []
+    max_id = -1
     for raw in cp.read_text(encoding="utf-8", errors="replace").splitlines():
         raw = raw.strip()
         if not raw:
             continue
         try:
             e = json.loads(raw)
-            sp = (e.get("speaker") or "").strip() or "Unknown"
-            tx = (e.get("text") or "").strip()
-            if tx:
-                out.append(f"{sp}: {tx}")
         except Exception:
             continue
-    return out[-last:] if last else out
+        eid = e.get("id")
+        eid = int(eid) if isinstance(eid, (int, float)) else None
+        if eid is not None and eid > max_id:
+            max_id = eid
+        if since_id is not None and eid is not None and eid <= since_id:
+            continue
+        sp = (e.get("speaker") or "").strip() or "Unknown"
+        tx = (e.get("text") or "").strip()
+        if tx:
+            lines.append(f"{sp}: {tx}")
+            ids.append(eid if eid is not None else -1)
+    if last and not since_id:
+        lines, ids = lines[-last:], ids[-last:]
+    return lines, ids, max_id
 
 
-def transcript(last: Optional[int] = None) -> Dict[str, Any]:
+def transcript(last: Optional[int] = None,
+               since_id: Optional[int] = None) -> Dict[str, Any]:
     """Read the current transcript. Returns raw rolling caption snapshots in
     ``lines`` (good for the post-call collapse / debugging) AND deduplicated
-    finalized utterances in ``cleanLines`` (what a realtime agent should use)."""
+    finalized utterances in ``cleanLines`` (what a realtime agent should use).
+
+    Pass ``since_id`` for incremental, lossless cursor reads: ``cleanLines`` then
+    holds only turns newer than that id, and ``maxCleanId`` is the cursor to
+    pass next time."""
     active = _read_active()
     if not active:
         return {"ok": False, "reason": "no active meeting"}
 
     out_dir = Path(active.get("out_dir", ""))
     tp = out_dir / "transcript.txt"
-    clean_lines = _read_clean_lines(out_dir, last)
+    clean_lines, clean_ids, max_clean_id = _read_clean_lines(out_dir, last, since_id)
+    base = {
+        "ok": True,
+        "meetingId": active.get("meeting_id"),
+        "cleanLines": clean_lines,
+        "cleanLineIds": clean_ids,
+        "maxCleanId": max_clean_id,
+    }
     if not tp.is_file():
-        return {
-            "ok": True,
-            "meetingId": active.get("meeting_id"),
-            "lines": [],
-            "cleanLines": clean_lines,
-            "total": 0,
-            "path": str(tp),
-        }
+        return {**base, "lines": [], "total": 0, "path": str(tp)}
     text = tp.read_text(encoding="utf-8", errors="replace")
     all_lines = [ln for ln in text.splitlines() if ln.strip()]
     lines = all_lines[-last:] if last else all_lines
-    return {
-        "ok": True,
-        "meetingId": active.get("meeting_id"),
-        "lines": lines,
-        "cleanLines": clean_lines,
-        "total": len(all_lines),
-        "path": str(tp),
-    }
+    return {**base, "lines": lines, "total": len(all_lines), "path": str(tp)}
 
 
 def enqueue_say(text: str) -> Dict[str, Any]:

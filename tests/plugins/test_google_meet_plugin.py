@@ -205,9 +205,53 @@ def test_transcript_reader_exposes_clean_lines(tmp_path):
         '{"ts":"00:00:05","speaker":"Bob","text":"как дела"}\n',
         encoding="utf-8",
     )
-    lines = pm._read_clean_lines(out, last=None)
+    lines, ids, max_id = pm._read_clean_lines(out, last=None)
     assert lines == ["Alice: привет мир", "Bob: как дела"]
-    assert pm._read_clean_lines(out, last=1) == ["Bob: как дела"]
+    lines1, _ids1, _m1 = pm._read_clean_lines(out, last=1)
+    assert lines1 == ["Bob: как дела"]
+
+
+def test_clean_lines_cursor_sinceid_is_lossless(tmp_path):
+    from plugins.google_meet import process_manager as pm
+
+    out = tmp_path / "m"
+    out.mkdir()
+    (out / "transcript_clean.jsonl").write_text(
+        '{"id":0,"ts":"00:00:01","speaker":"Alice","text":"раз"}\n'
+        '{"id":1,"ts":"00:00:05","speaker":"Bob","text":"два"}\n'
+        '{"id":2,"ts":"00:00:09","speaker":"Alice","text":"три"}\n',
+        encoding="utf-8",
+    )
+    # Full read reports the max cursor.
+    lines, ids, max_id = pm._read_clean_lines(out, last=None)
+    assert lines == ["Alice: раз", "Bob: два", "Alice: три"]
+    assert ids == [0, 1, 2] and max_id == 2
+    # Incremental read after cursor 1 → only the newer turn, cursor still advances.
+    lines2, ids2, max2 = pm._read_clean_lines(out, last=None, since_id=1)
+    assert lines2 == ["Alice: три"] and ids2 == [2] and max2 == 2
+    # Cursor at the end → nothing new, but max_id still reported (don't lose it).
+    lines3, ids3, max3 = pm._read_clean_lines(out, last=None, since_id=2)
+    assert lines3 == [] and ids3 == [] and max3 == 2
+
+
+def test_finalize_emits_monotonic_ids(tmp_path):
+    import json as _j
+    from plugins.google_meet.meet_bot import _BotState
+
+    out = tmp_path / "s"
+    state = _BotState(out_dir=out, meeting_id="x-y-z",
+                      url="https://meet.google.com/x-y-z", guest_name="Verter Multitender")
+    state.record_caption("Alice", "первая")
+    state.record_caption("Alice", "вторая реплика")  # divergence finalizes #0
+    state.record_caption("Bob", "ответ боба")
+    state.finalize_all()
+    entries = [_j.loads(l) for l in (out / "transcript_clean.jsonl").read_text().splitlines() if l.strip()]
+    assert [e["id"] for e in entries] == [0, 1, 2]
+    # Bot's own echo is kept out of the participant roster.
+    state.record_caption("Verter Multitender", "это эхо бота")
+    state.finalize_all()
+    assert "Verter Multitender" not in state.participant_names
+    assert "Alice" in state.participant_names and "Bob" in state.participant_names
 
 
 def test_request_summary_writes_marker_when_attended(tmp_path):

@@ -161,9 +161,12 @@ MEET_STATUS_SCHEMA: Dict[str, Any] = {
 MEET_TRANSCRIPT_SCHEMA: Dict[str, Any] = {
     "name": "meet_transcript",
     "description": (
-        "Read the scraped transcript for the active Meet session. Returns "
-        "full transcript unless 'last' is set, in which case returns the last "
-        "N lines only."
+        "Read the transcript for the active Meet session. Returns raw rolling "
+        "caption snapshots in 'lines' AND deduplicated finalized utterances in "
+        "'cleanLines' (use cleanLines for realtime — one entry per completed "
+        "turn, no partial/echo dupes). For lossless polling pass 'sinceId': "
+        "cleanLines then holds only turns newer than that id and 'maxCleanId' "
+        "is the cursor to pass next call (so no turn is missed or re-read)."
     ),
     "parameters": {
         "type": "object",
@@ -176,6 +179,16 @@ MEET_TRANSCRIPT_SCHEMA: Dict[str, Any] = {
                     "whole transcript."
                 ),
                 "minimum": 1,
+            },
+            "sinceId": {
+                "type": "integer",
+                "description": (
+                    "Optional cursor: return only finalized cleanLines with "
+                    "id greater than this. Pass the previous response's "
+                    "'maxCleanId' for incremental, lossless reads. Use -1 "
+                    "(or omit) to read from the start."
+                ),
+                "minimum": -1,
             },
             "node": {"type": "string"},
         },
@@ -301,17 +314,22 @@ def handle_meet_transcript(args: Dict[str, Any], **_kw) -> str:
             last_i = None
     except (TypeError, ValueError):
         last_i = None
+    since = args.get("sinceId")
+    try:
+        since_i = int(since) if since is not None else None
+    except (TypeError, ValueError):
+        since_i = None
     try:
         client, node_name = _resolve_node_client(args.get("node"))
     except RuntimeError as e:
         return _err(str(e))
     if client is not None:
         try:
-            res = client.transcript(last=last_i)
+            res = client.transcript(last=last_i, since_id=since_i)
             return _json({"success": bool(res.get("ok")), "node": node_name, **res})
         except Exception as e:
             return _err(f"remote node transcript failed: {e}", node=node_name)
-    res = pm.transcript(last=last_i)
+    res = pm.transcript(last=last_i, since_id=since_i)
     return _json({"success": bool(res.get("ok")), **res})
 
 

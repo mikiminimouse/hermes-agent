@@ -112,10 +112,14 @@ def _norm_caption(text: str) -> str:
 class _BotState:
     """Single-process mutable state, flushed to ``status.json`` on each change."""
 
-    def __init__(self, out_dir: Path, meeting_id: str, url: str):
+    def __init__(self, out_dir: Path, meeting_id: str, url: str,
+                 guest_name: str = ""):
         self.out_dir = out_dir
         self.meeting_id = meeting_id
         self.url = url
+        # Our own display name in Meet — used to keep the bot's TTS echo out of
+        # the participant roster (Meet attributes our captions to this name).
+        self.guest_name = guest_name or ""
         self.in_call = False
         self.captioning = False
         self.captions_enabled_attempted = False
@@ -145,7 +149,39 @@ class _BotState:
         self.transcript_path = out_dir / "transcript.txt"
         self.clean_path = out_dir / "transcript_clean.jsonl"
         self.status_path = out_dir / "status.json"
+        # Monotonic id for finalized clean utterances → lossless cursor polling
+        # (the agent reads meet_transcript(sinceId=N) and never misses/re-reads
+        # a turn). On restart, continue past ids already in the file.
+        self._finalize_counter: int = self._next_clean_id()
+        # Participant snapshot — drives the live greeting and the presence half
+        # of verbal-closure end-detection.
+        self.participant_count: Optional[int] = None
+        self.participant_names: list = []
+        self.greeted: bool = False
+        self.admitted_at: Optional[float] = None
         self._flush()
+
+    def _next_clean_id(self) -> int:
+        """Resume the clean-utterance id counter past whatever is already in
+        transcript_clean.jsonl, so a bot relaunch on the same dir never reuses
+        an id (which would corrupt the agent's read cursor)."""
+        try:
+            if not self.clean_path.is_file():
+                return 0
+            mx = -1
+            for ln in self.clean_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    i = int(json.loads(ln).get("id", -1))
+                    if i > mx:
+                        mx = i
+                except Exception:
+                    continue
+            return mx + 1
+        except Exception:
+            return 0
 
     # -------- transcript ------------------------------------------------
 
@@ -202,10 +238,17 @@ class _BotState:
         if not buf or not (buf.get("text") or "").strip():
             return
         entry = {
+            "id": self._finalize_counter,
             "ts": time.strftime("%H:%M:%S", time.localtime(buf["started"])),
             "speaker": speaker,
             "text": buf["text"].strip(),
         }
+        self._finalize_counter += 1
+        # Track human speakers for greeting / presence (best-effort; the People
+        # panel is unreliable, but whoever actually spoke is a real participant).
+        if _looks_like_human_speaker(speaker, getattr(self, "guest_name", "")) \
+                and speaker not in self.participant_names:
+            self.participant_names.append(speaker)
         try:
             with self.clean_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -252,6 +295,14 @@ class _BotState:
             "lastAudioOutAt": self.last_audio_out_at,
             "lastBargeInAt": self.last_barge_in_at,
             "leaveReason": self.leave_reason,
+            # Lossless-polling cursor: highest finalized clean-utterance id so
+            # far (-1 = none yet). Agent polls meet_transcript(sinceId=...).
+            "transcriptCleanLastId": self._finalize_counter - 1,
+            # Participant snapshot for greeting + presence end-detection.
+            "participantCount": self.participant_count,
+            "participantNames": list(self.participant_names),
+            "greeted": self.greeted,
+            "admittedAt": self.admitted_at,
         }
         tmp = self.status_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -771,7 +822,8 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
 
     out_dir = Path(out_dir_env)
     meeting_id = _meeting_id_from_url(url)
-    state = _BotState(out_dir=out_dir, meeting_id=meeting_id, url=url)
+    state = _BotState(out_dir=out_dir, meeting_id=meeting_id, url=url,
+                      guest_name=guest_name)
 
     # SIGTERM → exit cleanly so the parent ``meet_leave`` gets a finalized
     # transcript. We set a flag instead of raising so the Playwright context
@@ -1054,6 +1106,7 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
             ever_had_company = False
             alone_since: Optional[float] = None
             last_alone_check = 0.0
+            last_participant_check = 0.0
             while not stop_flag["stop"]:
                 now = time.time()
                 if deadline and now > deadline:
@@ -1085,6 +1138,7 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
                             in_call=True,
                             lobby_waiting=False,
                             joined_at=now,
+                            admitted_at=now,
                         )
                     # Check denial BEFORE the timeout so a real host-denial isn't
                     # misattributed as a lobby timeout (it would otherwise wait
@@ -1204,6 +1258,14 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
                         audio_bytes_out=getattr(rt["session"], "audio_bytes_out", 0),
                         last_audio_out_at=getattr(rt["session"], "last_audio_out_at", None),
                     )
+
+                # Refresh participant count (~8s) for greeting + presence-based
+                # end-detection. None = unknown (degrade gracefully).
+                if state.in_call and (now - last_participant_check) > 8.0:
+                    last_participant_check = now
+                    pc = _get_participant_count(page)
+                    if pc is not None and pc != state.participant_count:
+                        state.set(participant_count=pc)
 
                 # Close out any utterance that has paused, so the clean
                 # transcript (transcript_clean.jsonl) tracks the live dialogue.
@@ -1536,6 +1598,33 @@ def _detect_alone(page) -> bool:
         return bool(page.evaluate(probe))
     except Exception:
         return False
+
+
+def _get_participant_count(page) -> Optional[int]:
+    """Best-effort participant count from Meet's people button / call-header
+    aria-labels (RU+EN). Returns None when no explicit numeric count is visible
+    (degrade gracefully — caller treats None as "unknown"). Drives greeting
+    phrasing (1 vs team) and the presence half of verbal-closure end-detection."""
+    probe = r"""
+    (() => {
+      const els = [...document.querySelectorAll('button,[role="button"],[aria-label]')];
+      for (const e of els) {
+        const a = e.getAttribute('aria-label') || '';
+        const m = a.match(/(participants|people|участник[аи]?)\D{0,4}(\d+)/i)
+               || a.match(/(\d+)\D{0,4}(participants|people|участник)/i);
+        if (m) {
+          const n = parseInt(/\d/.test(m[2] || '') ? m[2] : m[1], 10);
+          if (Number.isFinite(n) && n > 0) return n;
+        }
+      }
+      return null;
+    })();
+    """
+    try:
+        v = page.evaluate(probe)
+        return int(v) if isinstance(v, (int, float)) and v > 0 else None
+    except Exception:
+        return None
 
 
 def _detect_denied(page) -> bool:
