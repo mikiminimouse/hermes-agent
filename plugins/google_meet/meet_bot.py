@@ -230,6 +230,7 @@ class _BotState:
         self.guest_name = guest_name or ""
         self.in_call = False
         self.captioning = False
+        self.caption_selector_drift = False   # К6: primary row selector stopped matching
         self.captions_enabled_attempted = False
         self.lobby_waiting = False
         self.join_attempted_at: Optional[float] = None
@@ -490,6 +491,7 @@ class _BotState:
             "url": self.url,
             "inCall": self.in_call,
             "captioning": self.captioning,
+            "captionSelectorDrift": self.caption_selector_drift,
             "captionsEnabledAttempted": self.captions_enabled_attempted,
             "lobbyWaiting": self.lobby_waiting,
             "joinAttemptedAt": self.join_attempted_at,
@@ -641,6 +643,37 @@ _CAPTION_OBSERVER_JS = r"""
   };
 })();
 """
+
+
+# К6: the per-speaker caption row selector, versioned in ONE place. When Meet
+# rewrites its obfuscated class names this is what drifts; _caption_selector_health
+# detects it so the bot doesn't silently fall back to the whole-region split (which
+# collapses all speakers into one blob — the multi-speaker bug).
+_CAPTION_ROW_SELECTOR = ".nMcdL"   # Jun 2026 verified (see caption_dom dump)
+
+
+def _caption_selector_health(page) -> Optional[bool]:
+    """Return True if the primary caption row selector has DRIFTED (the region has
+    caption text but the per-speaker selector matches 0 rows → we'd be on the
+    speaker-collapsing fallback), False if healthy, None if undeterminable (no
+    region / no text yet). Never raises."""
+    probe = r"""
+    (() => {
+      const sel = '[role="region"][aria-label*="aption" i], div[jsname="dsyhDe"]';
+      const root = document.querySelector(sel);
+      if (!root) return null;
+      const text = (root.innerText || '').trim();
+      if (!text) return null;                         // captions present? unknown
+      return { primaryRows: root.querySelectorAll('%s').length };
+    })();
+    """ % _CAPTION_ROW_SELECTOR
+    try:
+        r = page.evaluate(probe)
+    except Exception:
+        return None
+    if not isinstance(r, dict):
+        return None
+    return int(r.get("primaryRows", 0)) == 0   # text but 0 primary rows → drift
 
 
 def _enable_captions_js() -> str:
@@ -1344,6 +1377,7 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
             last_alone_check = 0.0
             last_participant_check = 0.0
             last_dom_dump = 0.0
+            last_selector_check = 0.0
             dump_caption_dom = os.environ.get(
                 "HERMES_MEET_DUMP_CAPTION_DOM", "").lower() in ("1", "true", "yes")
             while not stop_flag["stop"]:
@@ -1541,6 +1575,23 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
                 if dump_caption_dom and state.in_call and (now - last_dom_dump) > 5.0:
                     last_dom_dump = now
                     _dump_caption_dom(page, out_dir)
+
+                # К6: detect caption-row selector DRIFT (~30s). If captions have
+                # text but the primary per-speaker selector matches nothing, we're
+                # silently on the speaker-collapsing fallback — surface it loudly
+                # (WARNING + status flag) instead of shipping degraded transcripts.
+                if state.in_call and (now - last_selector_check) > 30.0:
+                    last_selector_check = now
+                    drift = _caption_selector_health(page)
+                    if drift is True and not state.caption_selector_drift:
+                        print(f"[meet_bot] WARNING caption selector drift: "
+                              f"'{_CAPTION_ROW_SELECTOR}' matched 0 rows while "
+                              f"captions present — speaker split degraded; update "
+                              f"the selector (run with HERMES_MEET_DUMP_CAPTION_DOM=1)",
+                              flush=True)
+                        state.set(caption_selector_drift=True)
+                    elif drift is False and state.caption_selector_drift:
+                        state.set(caption_selector_drift=False)   # recovered
 
                 # Close out any utterance that has paused, so the clean
                 # transcript (transcript_clean.jsonl) tracks the live dialogue.

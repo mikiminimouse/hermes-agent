@@ -282,6 +282,26 @@ def test_scroll_rerender_emits_no_duplicate(tmp_path):
     assert len(_clean_entries(out)) == 1
 
 
+def test_caption_selector_health_detects_drift():
+    # К6: text present but 0 primary rows → drift; rows present → healthy;
+    # no region / no text → None (undeterminable); probe error → None.
+    from plugins.google_meet.meet_bot import _caption_selector_health
+
+    class _Page:
+        def __init__(self, payload, boom=False):
+            self.payload, self.boom = payload, boom
+
+        def evaluate(self, _js):
+            if self.boom:
+                raise RuntimeError("boom")
+            return self.payload
+
+    assert _caption_selector_health(_Page({"primaryRows": 0})) is True
+    assert _caption_selector_health(_Page({"primaryRows": 3})) is False
+    assert _caption_selector_health(_Page(None)) is None      # no region/text
+    assert _caption_selector_health(_Page(None, boom=True)) is None
+
+
 def test_transcript_reader_exposes_clean_lines(tmp_path):
     from plugins.google_meet import process_manager as pm
 
