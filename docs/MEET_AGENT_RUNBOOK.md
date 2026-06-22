@@ -172,6 +172,26 @@ realtime-режиме «мозгом» выступает агент: читае
 5. Держи ответы короткими и живыми — это разговор, не лекция.
 6. Конец: `meet_leave` (graceful → авто-отчёт по разделу 5).
 
+## 6b. КРИТИЧНО: meet-конфиг должен быть в profile .env, а не только в systemd
+
+Корневая причина «бот заходит гостем → You can't join» при запуске НЕ из gateway
+(интерактивный TUI, `hermes chat -q`, `hermes -z`): переменные `HERMES_MEET_*`
+жили ТОЛЬКО в systemd drop-in `meet.conf`, который инжектится исключительно в
+процесс gateway-сервиса. CLI/TUI-агент стартует из shell без этих переменных →
+`process_manager.start()` делает `os.environ.copy()` без профиля → бот открывает
+ГОСТЕВОЙ Chromium (не signed-in `meet-google`) → Google сразу отвергает.
+
+ФИКС (сделан 2026-06-22): `HERMES_MEET_*` добавлены в `~/.hermes/profiles/verter/.env`.
+`hermes_cli/env_loader.load_hermes_dotenv()` грузит profile `.env` (HERMES_HOME)
+с `override=True` для ЛЮБОГО запуска — gateway, TUI и `-q/-z`. Теперь все пути
+получают профиль. (`MEET_CHROME_PROFILE` в .env было неверным именем и не читалось.)
+Проверка: `HERMES_HOME=.../verter venv/bin/python -c "from hermes_cli.env_loader
+import load_hermes_dotenv; load_hermes_dotenv(); import os;
+print(os.environ['HERMES_MEET_USER_DATA_DIR'])"` → должен вывести meet-google.
+
+Модель для созвонов: **gpt-5.4-mini** (быстрые ответы в реальном времени) —
+`hermes chat --profile verter -m gpt-5.4-mini -q "..." -s google-meet-operations --yolo -Q`.
+
 ## 7. Частые ошибки (НЕ повторяй)
 
 - **Слишком короткое окно admission.** 2 минуты мало — хост не успевает впустить.
