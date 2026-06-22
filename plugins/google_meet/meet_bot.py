@@ -109,6 +109,31 @@ def _norm_caption(text: str) -> str:
     return t.strip()
 
 
+# High-precision closing/farewell markers (RU+EN). Deliberately strict so a
+# mid-meeting "спасибо за апдейт" / "thanks for that" does NOT misfire — the
+# bot only writes a closing CANDIDATE; the actual graceful exit additionally
+# requires a presence-drop (everyone disconnected). See _BotState.
+_FAREWELL_RE = re.compile(
+    r"(до свидан|до встреч|всем пока|пока пока|увидимся|созвон(имся|]?)?\s*позже|"
+    r"встреча (окончен|завершен|законч|подошла к концу)|"
+    r"на этом (всё|все|закончим|завершаем|заканчива)|"
+    r"(будем|давайте|давай) (заканчива|завершать)|заканчива(ем|ю) (встречу|созвон|совещание)|"
+    r"спасибо (всем )?за (встречу|участие|внимание|созвон)|"
+    r"хорошего (дня|вечера)|всем хорошего|"
+    r"good ?bye|\bbye\b|see you|talk (to you )?later|"
+    r"that s (all|it)( for)?|wrap (it |this )?up|"
+    r"thanks (everyone|you all|all)|have a (good|great) (day|one|evening)|"
+    r"end (the )?(call|meeting))",
+    flags=re.IGNORECASE,
+)
+
+
+def _is_farewell_candidate(text: str) -> bool:
+    """True if an utterance reads like a meeting closing/farewell. High-precision
+    candidate only — graceful exit also requires presence-drop (conjunction)."""
+    return bool(_FAREWELL_RE.search(_norm_caption(text)))
+
+
 class _BotState:
     """Single-process mutable state, flushed to ``status.json`` on each change."""
 
@@ -159,6 +184,10 @@ class _BotState:
         self.participant_names: list = []
         self.greeted: bool = False
         self.admitted_at: Optional[float] = None
+        # Last time a human said something that reads like a meeting close. Paired
+        # with a presence-drop it triggers a graceful 'verbal_closure' exit.
+        self.meeting_closing_at: Optional[float] = None
+        self.closing_path = out_dir / "meeting_closing.json"
         self._flush()
 
     def _next_clean_id(self) -> int:
@@ -244,11 +273,22 @@ class _BotState:
             "text": buf["text"].strip(),
         }
         self._finalize_counter += 1
+        text = entry["text"]
+        is_human = _looks_like_human_speaker(speaker, getattr(self, "guest_name", ""))
         # Track human speakers for greeting / presence (best-effort; the People
         # panel is unreliable, but whoever actually spoke is a real participant).
-        if _looks_like_human_speaker(speaker, getattr(self, "guest_name", "")) \
-                and speaker not in self.participant_names:
+        if is_human and speaker not in self.participant_names:
             self.participant_names.append(speaker)
+        # Closing candidate: a human said something that reads like a farewell.
+        # Recorded only; the actual graceful exit needs presence-drop too.
+        if is_human and _is_farewell_candidate(text):
+            self.meeting_closing_at = time.time()
+            try:
+                self.closing_path.write_text(json.dumps(
+                    {"at": self.meeting_closing_at, "by": speaker, "quote": text[:200]},
+                    ensure_ascii=False, indent=2), encoding="utf-8")
+            except OSError:
+                pass
         try:
             with self.clean_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -1180,7 +1220,19 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
                     elif ever_had_company:
                         if alone_since is None:
                             alone_since = now
-                        elif (now - alone_since) >= alone_timeout:
+                        # Verbal goodbye AND everyone has since left → strong,
+                        # unambiguous end: exit gracefully NOW as 'verbal_closure'
+                        # instead of waiting the full alone grace (which guards
+                        # against accidental drops). This is the conjunction the
+                        # user asked for: closure said + then disconnected.
+                        recent_closing = (
+                            state.meeting_closing_at is not None
+                            and (now - state.meeting_closing_at) <= 180.0
+                        )
+                        if recent_closing:
+                            state.set(leave_reason="verbal_closure")
+                            break
+                        if (now - alone_since) >= alone_timeout:
                             state.set(leave_reason="alone")
                             break
 
@@ -1328,7 +1380,8 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
             # bot actually attended (alone / duration / host-left / explicit
             # leave / page closed) — never for denied or lobby_timeout, which
             # request_summary() also guards by joined_at/transcript_lines.
-            GRACEFUL_END = {"alone", "duration_expired", "meet_leave", "page_closed", None}
+            GRACEFUL_END = {"alone", "duration_expired", "meet_leave",
+                            "page_closed", "verbal_closure", None}
             if state.leave_reason in GRACEFUL_END:
                 try:
                     marker = state.request_summary()

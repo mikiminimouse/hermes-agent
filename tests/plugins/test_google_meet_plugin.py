@@ -254,6 +254,46 @@ def test_finalize_emits_monotonic_ids(tmp_path):
     assert "Alice" in state.participant_names and "Bob" in state.participant_names
 
 
+def test_farewell_candidate_high_precision(tmp_path):
+    from plugins.google_meet.meet_bot import _is_farewell_candidate
+    # Positives — RU + EN closings.
+    for t in ["Всем спасибо, до свидания!", "Давайте заканчивать встречу",
+              "На этом всё, хорошего дня", "Ок, see you later", "Let's wrap up",
+              "thanks everyone, bye"]:
+        assert _is_farewell_candidate(t), t
+    # Negatives — mid-meeting phrases that must NOT misfire.
+    for t in ["Спасибо за апдейт", "Давайте к следующему пункту",
+              "thanks for that info", "продолжаем работать", "это всё по дизайну"]:
+        assert not _is_farewell_candidate(t), t
+
+
+def test_finalize_writes_closing_marker_for_human_farewell(tmp_path):
+    import json as _j
+    from plugins.google_meet.meet_bot import _BotState
+
+    out = tmp_path / "s"
+    state = _BotState(out_dir=out, meeting_id="x-y-z",
+                      url="https://meet.google.com/x-y-z", guest_name="Verter Multitender")
+    state.record_caption("Виталий Бычков", "всем спасибо, до свидания")
+    state.finalize_all()
+    assert state.meeting_closing_at is not None
+    marker = _j.loads((out / "meeting_closing.json").read_text())
+    assert marker["by"] == "Виталий Бычков" and "свидания" in marker["quote"]
+
+
+def test_bot_farewell_echo_does_not_trigger_closing(tmp_path):
+    from plugins.google_meet.meet_bot import _BotState
+
+    out = tmp_path / "s"
+    state = _BotState(out_dir=out, meeting_id="x-y-z",
+                      url="https://meet.google.com/x-y-z", guest_name="Verter Multitender")
+    # The bot's OWN goodbye (echo) must not be treated as the meeting closing.
+    state.record_caption("Verter Multitender", "до свидания, спасибо за встречу")
+    state.finalize_all()
+    assert state.meeting_closing_at is None
+    assert not (out / "meeting_closing.json").exists()
+
+
 def test_request_summary_writes_marker_when_attended(tmp_path):
     from plugins.google_meet.meet_bot import _BotState
 
