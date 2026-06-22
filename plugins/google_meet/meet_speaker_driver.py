@@ -84,12 +84,12 @@ GUEST = os.environ.get("HERMES_MEET_GUEST_NAME", "Verter Multitender")
 POLL_SEC = _envf("DRIVER_POLL_SEC", 1.2, 0.5, 30)
 MAX_CTX_LINES = _envi("DRIVER_MAX_CTX_LINES", 24, 4, 200)  # dialogue lines → LLM
 
-# Address fuzzy-match ratio: a word must START like the name (вер/вэр/вёр) AND
-# score >= this vs. "вертер". 0.8 catches ASR manglings (вертел/вертера) while
-# weather words (ветер/ветра, prefix вет-) are excluded by the prefix guard. The
-# strict LLM prompt is the SECOND filter. NB: this is NOT REPLY_DEDUP_RATIO —
-# older comments drifted and conflated the two (0.8 here vs 0.72 there).
-ADDRESS_FUZZY_RATIO = _envf("DRIVER_ADDRESS_FUZZY_RATIO", 0.8, 0.5, 1.0)
+# Address fuzzy-match ratio (B4): a word with a в-vowel onset must score >= this
+# vs. a name anchor (вертер/вектор) to pass the HIGH-RECALL gate. 0.7 lets near
+# manglings (вектор/вертел/вэртер — and, deliberately, ветер/вечер) reach the
+# LLM, which is the PRECISION filter that returns SKIP for weather/evening. A
+# strict gate made the bot go deaf on real addresses. NB: NOT REPLY_DEDUP_RATIO.
+ADDRESS_FUZZY_RATIO = _envf("DRIVER_ADDRESS_FUZZY_RATIO", 0.7, 0.5, 1.0)
 
 # End-of-meeting detection now lives in the BOT (К3: single source of truth —
 # HERMES_MEET_END_GRACE / HERMES_MEET_MAX_IDLE), which sets leaveReason from the
@@ -120,21 +120,26 @@ _HERMES_BIN = os.environ.get(
     "/home/vitaly/.local/bin:/home/vitaly/.nvm/versions/node/v24.13.1/bin")
 
 
-# Address detection: the bot responds only when called by name. Russian ASR
-# routinely mangles "Вертер" (heard "ветра", "ветер", "вертел"…), so we fuzzy-
-# match each word against "вертер". The strict LLM prompt is the second filter —
-# if a near-miss like "ветер" (wind) wasn't really an address, the model returns
-# SKIP. Greeting on join and goodbye on close are the only unprompted lines.
+# Address pre-filter (B4): a HIGH-RECALL gate, NOT the final decision. Russian
+# ASR mangles "Вертер" badly (heard "вектор", "вэртер", "вертел", even "ветер"),
+# and a strict gate made the bot go DEAF on real addresses (field complaint). So
+# we pass anything that plausibly sounds like the name to the LLM, whose system
+# prompt is the PRECISION filter — it returns SKIP for weather ("ветер"), evening
+# ("вечер"), or people talking to each other. Better a wasted SKIP than a missed
+# address. Greeting on join and goodbye on close are the only unprompted lines.
+_NAME_EXACT = ("вертер", "вэртер", "вёртер", "verter", "verther")
+_NAME_ANCHORS = ("вертер", "вектор")
+
+
 def _addressed(text: str) -> bool:
     t = (text or "").lower()
-    if "verter" in t or "вертер" in t or "вэртер" in t:
+    if any(n in t for n in _NAME_EXACT):
         return True
-    for w in re.findall(r"[а-яёa-z]{5,9}", t):
-        # Must START like the name (вер/вэр/вёр). Weather words "ветер"/"ветра"
-        # begin with "вет-" and would otherwise fuzzy-match high. Clean
-        # "вертер"/"verter" already caught above.
-        if w[:3] in ("вер", "вэр", "вёр") and \
-                difflib.SequenceMatcher(None, w, "вертер").ratio() >= ADDRESS_FUZZY_RATIO:
+    for w in re.findall(r"[а-яёa-z]{4,9}", t):
+        # в-vowel onset (вектор/вертел/ветер/вечер…) → let the LLM disambiguate.
+        if w[:2] in ("ве", "вэ", "вё", "ve") and max(
+                difflib.SequenceMatcher(None, w, a).ratio() for a in _NAME_ANCHORS
+        ) >= ADDRESS_FUZZY_RATIO:
             return True
     return False
 
@@ -193,8 +198,14 @@ _SYS = (
     "имени «Вертер»/«Verter» или явной просьбой к тебе («Вертер, сделай…», "
     "«спроси у Вертера…»). Если люди просто разговаривают между собой, обсуждают "
     "что-то НЕ обращаясь к тебе — ты МОЛЧИШЬ.\n"
+    "ВАЖНО про имя: распознавание речи часто КОВЕРКАЕТ «Вертер» — ты можешь "
+    "увидеть «Вектор», «Вэртер», «Вертел», «Вертера» и т.п. Если по смыслу "
+    "обращаются к тебе (даже с искажённым именем) — отвечай как себе. НО если "
+    "это про ПОГОДУ («ветер», «ветра»), время суток («вечер»), или похожее слово "
+    "НЕ как обращение — это НЕ к тебе.\n"
     "Реши по последней реплике:\n"
-    "- Обращения к тебе нет / это разговор людей между собой → ответь РОВНО: SKIP\n"
+    "- Обращения к тебе нет / это разговор людей между собой / это про погоду или "
+    "случайно похожее слово → ответь РОВНО: SKIP\n"
     "- Тебя ЯВНО попросили ВЫПОЛНИТЬ конкретное тяжёлое действие (найди, проверь, "
     "посчитай, настрой, напиши код/документ) → ответь РОВНО одной строкой: "
     "[DELEGATE] <короткое описание задачи своими словами>. НЕ делегируй, если "
