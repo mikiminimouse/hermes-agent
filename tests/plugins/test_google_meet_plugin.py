@@ -282,6 +282,37 @@ def test_scroll_rerender_emits_no_duplicate(tmp_path):
     assert len(_clean_entries(out)) == 1
 
 
+def test_speaker_change_finalizes_previous_immediately(tmp_path):
+    # Elegant finalization: a caption from a DIFFERENT speaker finalizes the
+    # previous speaker's pending turn NOW, without waiting out the pause timer.
+    from plugins.google_meet.meet_bot import _BotState
+
+    out = tmp_path / "s"
+    state = _BotState(out_dir=out, meeting_id="x-y-z",
+                      url="https://meet.google.com/x-y-z")
+    state.record_caption("Алиса", "что там по задаче")
+    assert _clean_entries(out) == []          # still live, nothing finalized yet
+    # Боб speaks → Алиса yielded the floor → her turn finalizes immediately.
+    state.record_caption("Боб", "сейчас расскажу")
+    entries = _clean_entries(out)
+    assert len(entries) == 1
+    assert entries[0]["speaker"] == "Алиса" and entries[0]["text"] == "что там по задаче"
+
+
+def test_adaptive_finalize_pause():
+    from plugins.google_meet.meet_bot import (
+        _finalize_pause, _CAPTION_FINALIZE_PAUSE, _CAPTION_FINALIZE_PAUSE_FAST,
+    )
+    # Complete-looking sentence → fast.
+    assert _finalize_pause("что там по задаче") == _CAPTION_FINALIZE_PAUSE_FAST
+    # Trails off on a preposition/conjunction → full pause (don't cut off).
+    assert _finalize_pause("давай сделаем отчёт для") == _CAPTION_FINALIZE_PAUSE
+    assert _finalize_pause("я думаю что") == _CAPTION_FINALIZE_PAUSE
+    # A lone word might be the start of a sentence → full, unless punctuated.
+    assert _finalize_pause("вертер") == _CAPTION_FINALIZE_PAUSE
+    assert _finalize_pause("вертер?") == _CAPTION_FINALIZE_PAUSE_FAST
+
+
 def test_farewell_detected_on_refine_path(tmp_path):
     # BUG #1 (found live, upa-pwci-tmk): a farewell appended to a GROWING turn is
     # folded as a refinement (rewrite-in-place), which early-returns. Presence +

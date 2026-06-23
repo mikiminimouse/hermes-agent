@@ -94,9 +94,49 @@ def _meeting_id_from_url(url: str) -> str:
 _CAPTION_PUNCT_RE = re.compile(r"[^\w\s]", flags=re.UNICODE)
 _CAPTION_WS_RE = re.compile(r"\s+")
 # Seconds a speaker's caption can stay unchanged before we finalize the utterance
-# (Vexa idle-finalization; Meet has no is_final flag). ~2s ≈ a natural human
-# pause between turns. Env-overridable for live tuning; tests also patch it.
+# (Vexa idle-finalization; Meet has no is_final flag). This is the FALLBACK / max
+# wait — the primary triggers are speaker-change (record_caption) and an adaptive,
+# text-aware pause (see _finalize_pause). Env-overridable; tests also patch it.
 _CAPTION_FINALIZE_PAUSE = float(os.environ.get("HERMES_MEET_FINALIZE_PAUSE", "2.0"))
+# Short pause used when the utterance LOOKS complete — collapses the ~2s latency
+# of the old fixed timer toward zero for a finished sentence (OpenAI semantic-VAD
+# principle, applied to text since Meet captions rarely carry punctuation).
+_CAPTION_FINALIZE_PAUSE_FAST = float(
+    os.environ.get("HERMES_MEET_FINALIZE_PAUSE_FAST", "0.8"))
+# Words that signal "more is coming" — a turn ending here is NOT finalized fast;
+# we wait out the full pause so we don't cut the speaker off mid-thought.
+# Russian conjunctions/prepositions/fillers + common English function words.
+_INCOMPLETE_TAIL = frozenset((
+    "и", "а", "но", "или", "что", "чтобы", "как", "когда", "если", "потому",
+    "поэтому", "для", "на", "в", "во", "с", "со", "по", "к", "ко", "от", "до",
+    "из", "у", "о", "об", "про", "за", "над", "под", "при", "то", "же", "ли",
+    "эм", "ну", "так", "это", "значит", "вот", "типа", "короче", "бы",
+    "and", "or", "but", "so", "the", "a", "an", "to", "of", "for", "with",
+    "that", "because", "if", "my", "your", "this",
+))
+
+
+def _finalize_pause(norm: str) -> float:
+    """Adaptive finalize delay for a buffered utterance (text-aware endpointing).
+
+    Returns the SHORT pause when the text looks complete (so the bot reacts
+    quickly), and the FULL pause when it trails off on a conjunction/preposition/
+    filler (so we don't finalize someone who's mid-thought). Punctuation, when
+    Meet does emit it, is a strong completeness cue.
+    """
+    t = (norm or "").strip()
+    if not t:
+        return _CAPTION_FINALIZE_PAUSE
+    words = t.split()
+    last = words[-1]
+    # Trailing conjunction/preposition/filler → wait out the full pause.
+    if last in _INCOMPLETE_TAIL:
+        return _CAPTION_FINALIZE_PAUSE
+    # A lone word could be the START of a sentence ("вертер…", "слушай…") — give
+    # it the full pause unless it ends with sentence punctuation.
+    if len(words) < 2 and not re.search(r"[.!?…]$", t):
+        return _CAPTION_FINALIZE_PAUSE
+    return _CAPTION_FINALIZE_PAUSE_FAST
 
 # К3: dialogue-based auto-end. The BOT owns end-detection (it has the captions =
 # ground truth for who actually spoke); the speaker driver only consumes
@@ -315,6 +355,12 @@ class _BotState:
         text = (text or "").strip()
         if not text:
             return
+        # ELEGANT FINALIZATION — primary trigger: speaker change. A caption from a
+        # DIFFERENT speaker means whoever was talking has yielded the floor, so
+        # finalize their pending turn NOW instead of waiting out the pause timer
+        # (near-zero latency for normal turn-taking; community-standard cue).
+        for other in [s for s in self._live if s != speaker]:
+            self._finalize_speaker(other)
         # Live dedup runs on every snapshot (also drives idle-finalization).
         self._update_live(speaker, text)
         key = f"{speaker}|{text}"
@@ -460,12 +506,15 @@ class _BotState:
             return False
 
     def tick_finalize(self, now: Optional[float] = None) -> None:
-        """Finalize any speaker whose caption has been static for the pause
-        window (Vexa idle-finalization — Meet has no is_final flag). Call this
-        periodically from the main loop so utterances close on natural pauses."""
+        """Finalize any speaker whose caption has been static long enough. The
+        delay is ADAPTIVE (see _finalize_pause): short when the utterance looks
+        complete, full when it trails off on a conjunction/filler — so a finished
+        sentence closes fast while a mid-thought pause isn't cut off. Speaker
+        change (record_caption) is the other, faster finalization trigger."""
         ref = now if now is not None else time.time()
         for speaker in list(self._live.keys()):
-            if ref - self._live[speaker]["updated"] >= _CAPTION_FINALIZE_PAUSE:
+            buf = self._live[speaker]
+            if ref - buf["updated"] >= _finalize_pause(buf.get("norm", "")):
                 self._finalize_speaker(speaker)
 
     def dialogue_end_reason(self, now: float) -> Optional[str]:
