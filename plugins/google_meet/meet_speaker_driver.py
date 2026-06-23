@@ -143,6 +143,35 @@ def _addressed(text: str) -> bool:
             return True
     return False
 
+
+def _pick_addressed_turn(lines, ids, processed: set, replied_ids: set):
+    """Scan polled clean lines and return (addressed_id, fresh).
+
+    React to a line only when its (id, normalized-text) is NEW — Meet refines a
+    turn IN PLACE under the same id (К1 dedup), so we must notice TEXT changes,
+    not just new ids, or an address folded into a growing turn is missed. A given
+    turn-id is answered at most once (replied_ids), so a still-growing addressed
+    turn isn't re-answered. ``fresh`` is the newly-seen [(id, line)] for context;
+    ``addressed_id`` is the newest freshly-addressed, not-yet-answered turn-id.
+    Mutates ``processed`` with the (id, norm) keys it has now handled.
+    """
+    addressed_id = None
+    fresh = []
+    for i, line in enumerate(lines):
+        lid = ids[i] if i < len(ids) else None
+        speaker = line.split(":", 1)[0].strip() if ":" in line else ""
+        text = line.split(":", 1)[1].strip() if ":" in line else line
+        if _is_self(speaker):
+            continue          # ignore our own TTS echo
+        key = (lid, _norm_task(text))
+        if key in processed:
+            continue          # unchanged line we already handled
+        processed.add(key)
+        fresh.append((lid, line))
+        if _addressed(text) and lid not in replied_ids:
+            addressed_id = lid
+    return addressed_id, fresh
+
 # Background-task throttle: ONE tool-capable agent at a time + dedup of
 # near-identical tasks, so a topic discussed repeatedly (with the bot named) does
 # NOT spawn a swarm of hermes -z agents (live test spawned 13 in 2 min).
@@ -431,9 +460,10 @@ def main(argv) -> int:
     # farewell (status.farewellDetectedAt) — we no longer detect farewell or run
     # idle timers ourselves.
     cursor = -1
-    convo: list = []          # rolling "Speaker: text" of the whole dialogue
-    addressed = False         # bot was explicitly addressed in the new lines
-    farewelled = False        # we've already said our goodbye
+    convo_by_id: dict = {}      # turn-id -> "Speaker: text" (latest text per turn)
+    processed: set = set()      # (id, norm) already handled → react only on CHANGE
+    replied_ids: set = set()    # turn-ids we already answered an address for
+    farewelled = False          # we've already said our goodbye
     recent_replies: list = []   # norms of the last REPLY_DEDUP_KEEP replies
     llm_err_streak = 0          # consecutive LLM failures → circuit-breaker
     while True:
@@ -445,20 +475,29 @@ def main(argv) -> int:
             _log(out_dir, "end: bot process not alive → leaving")
             break
 
-        tr = pm.transcript(since_id=cursor if cursor >= 0 else None)
-        new = tr.get("cleanLines") or []
+        # Re-include the LATEST finalized line (cursor-1), not just strictly-newer
+        # ids: Meet refines a turn IN PLACE (same id, К1 dedup), so pure id>cursor
+        # polling is blind to a turn that keeps GROWING — the bot missed addresses
+        # folded into a growing turn (live test wtp-oirr-stc). We react when a
+        # line's TEXT changes, deduped by (id, norm), and answer a given turn-id's
+        # address only once (replied_ids) so a growing turn isn't re-answered.
+        poll_since = (cursor - 1) if cursor >= 1 else None
+        tr = pm.transcript(since_id=poll_since)
+        lines = tr.get("cleanLines") or []
+        ids = tr.get("cleanLineIds") or []
         if isinstance(tr.get("maxCleanId"), int) and tr["maxCleanId"] >= 0:
             cursor = tr["maxCleanId"]
-        addressed = False   # per-batch: reset every tick so it never lingers
-        for line in new:
-            speaker = line.split(":", 1)[0].strip() if ":" in line else ""
-            text = line.split(":", 1)[1].strip() if ":" in line else line
-            if _is_self(speaker):
-                continue          # ignore our own TTS echo
-            convo.append(line)
-            if _addressed(text):          # bot called by name (ASR-fuzzy)
-                addressed = True
-        convo = convo[-MAX_CTX_LINES:]
+        addressed_id, fresh = _pick_addressed_turn(lines, ids, processed, replied_ids)
+        for lid, line in fresh:
+            convo_by_id[lid] = line
+        if len(processed) > 400:          # bound memory on a long call
+            processed = set(list(processed)[-200:])
+        if len(convo_by_id) > 200:
+            for k in sorted(convo_by_id, key=lambda x: (x is None, x))[:-100]:
+                convo_by_id.pop(k, None)
+        if cursor >= 0:                   # ids are monotonic → drop far-past ones
+            replied_ids = {i for i in replied_ids if i is None or i > cursor - 200}
+        convo = [convo_by_id[k] for k in sorted(convo_by_id, key=lambda x: (x is None, x))][-MAX_CTX_LINES:]
 
         # Goodbye is an EXCEPTION to address-gating: the bot detected a farewell
         # (single-source) → finish our speech before it leaves. Greeting + goodbye
@@ -477,8 +516,7 @@ def main(argv) -> int:
             _log(out_dir, f"farewell: {bye[:60]}")
 
         # Normal turns: respond ONLY when explicitly addressed (by name / wake).
-        elif addressed:
-            addressed = False
+        elif addressed_id is not None:
             _t_llm0 = time.time()
             reply = _llm([
                 {"role": "system", "content": _SYS},
@@ -500,6 +538,7 @@ def main(argv) -> int:
                     _say("Извините, сейчас не могу ответить — давайте чуть позже.")
             else:
                 llm_err_streak = 0   # any real LLM response resets the breaker
+                replied_ids.add(addressed_id)   # answered this turn → don't repeat
                 if reply.strip().upper() == "SKIP":
                     _log(out_dir, f"skip (not really for me) [llm {_llm_dt:.1f}s]")
                 elif reply.strip().startswith("[DELEGATE]"):
