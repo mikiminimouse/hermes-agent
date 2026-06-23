@@ -378,6 +378,12 @@ class _BotState:
             # duplicate clean turn. (File is small at call scale — see К1 note.)
             if isinstance(target.get("id"), int) and self._rewrite_clean_entry(target["id"], text):
                 ded.update(target, norm, text)
+                # BUGFIX: presence + farewell must fire even when the turn is folded
+                # as a refinement. A farewell appended to a growing utterance ("…
+                # Вертер до свидания, встреча окончена") arrives via this refine path;
+                # without this the closing/last_human signals were skipped and the
+                # bot never auto-ended on a goodbye (found in live test upa-pwci-tmk).
+                self._note_human_signals(speaker, text)
                 return
             # rewrite failed → fall through and emit as a fresh turn
         entry = {
@@ -388,18 +394,30 @@ class _BotState:
         }
         self._finalize_counter += 1
         ded.add(norm, entry["id"], text)
-        is_human = _looks_like_human_speaker(speaker, getattr(self, "guest_name", ""))
-        # Track human speakers for greeting / presence (best-effort; the People
-        # panel is unreliable, but whoever actually spoke is a real participant).
-        if is_human and speaker not in self.participant_names:
+        self._note_human_signals(speaker, text)
+        try:
+            with self.clean_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
+
+    def _note_human_signals(self, speaker: str, text: str) -> None:
+        """Record presence + closing signals from a finalized human turn. Called
+        on BOTH the new-emit and the refine paths so a farewell/last-spoke signal
+        is never lost just because Meet folded the turn as a late refinement (К3).
+        """
+        if not _looks_like_human_speaker(speaker, getattr(self, "guest_name", "")):
+            return
+        # Track human speakers for greeting / presence (the People panel is
+        # unreliable, but whoever actually spoke is a real participant).
+        if speaker not in self.participant_names:
             self.participant_names.append(speaker)
-        # К3: a human just spoke → presence signal for dialogue-based auto-end.
-        if is_human:
-            self.last_human_at = time.time()
-            self.had_human = True
-        # Closing candidate: a human said something that reads like a farewell.
-        # Recorded only; the actual graceful exit needs presence-drop too.
-        if is_human and _is_farewell_candidate(text):
+        # A human just spoke → presence signal for dialogue-based auto-end.
+        self.last_human_at = time.time()
+        self.had_human = True
+        # Closing candidate: reads like a farewell. Recorded only; the actual
+        # graceful exit also needs the humans to go quiet (see dialogue_end_reason).
+        if _is_farewell_candidate(text):
             self.meeting_closing_at = time.time()
             try:
                 self.closing_path.write_text(json.dumps(
@@ -407,11 +425,6 @@ class _BotState:
                     ensure_ascii=False, indent=2), encoding="utf-8")
             except OSError:
                 pass
-        try:
-            with self.clean_path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        except OSError:
-            pass
 
     def _rewrite_clean_entry(self, entry_id: int, text: str) -> bool:
         """Replace a finalized clean entry with a late longer refinement.

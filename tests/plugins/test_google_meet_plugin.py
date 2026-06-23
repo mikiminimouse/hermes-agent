@@ -282,6 +282,39 @@ def test_scroll_rerender_emits_no_duplicate(tmp_path):
     assert len(_clean_entries(out)) == 1
 
 
+def test_farewell_detected_on_refine_path(tmp_path):
+    # BUG #1 (found live, upa-pwci-tmk): a farewell appended to a GROWING turn is
+    # folded as a refinement (rewrite-in-place), which early-returns. Presence +
+    # farewell signals must still fire on that path, else the bot never auto-ends
+    # on a spoken goodbye.
+    import time
+    from plugins.google_meet.meet_bot import _BotState, _CAPTION_FINALIZE_PAUSE
+
+    out = tmp_path / "s"
+    state = _BotState(out_dir=out, meeting_id="x-y-z",
+                      url="https://meet.google.com/x-y-z")
+    t = time.time()
+    # First the turn finalizes WITHOUT a farewell.
+    state.record_caption("Виталий", "ну что давай уже заканчивать обсуждение")
+    state.tick_finalize(now=t + _CAPTION_FINALIZE_PAUSE + 1)
+    assert state.meeting_closing_at is None
+    last_human_1 = state.last_human_at
+    assert last_human_1 is not None
+    # Meet keeps growing the SAME utterance and appends a farewell → refine path.
+    state.record_caption(
+        "Виталий",
+        "ну что давай уже заканчивать обсуждение всем спасибо до свидания встреча окончена")
+    state.tick_finalize(now=t + 100 + _CAPTION_FINALIZE_PAUSE + 1)
+    # Farewell + presence recorded even though the turn was folded as a refinement.
+    assert state.meeting_closing_at is not None
+    assert state.had_human is True
+    assert state.last_human_at >= last_human_1
+    # And the dialogue-end now fires verbal_closure after the grace.
+    from plugins.google_meet.meet_bot import _END_GRACE
+    state.in_call = True
+    assert state.dialogue_end_reason(state.last_human_at + _END_GRACE + 1) == "verbal_closure"
+
+
 def test_caption_selector_health_detects_drift():
     # К6: text present but 0 primary rows → drift; rows present → healthy;
     # no region / no text → None (undeterminable); probe error → None.
@@ -300,6 +333,28 @@ def test_caption_selector_health_detects_drift():
     assert _caption_selector_health(_Page({"primaryRows": 3})) is False
     assert _caption_selector_health(_Page(None)) is None      # no region/text
     assert _caption_selector_health(_Page(None, boom=True)) is None
+
+
+def test_extractive_report_reason_is_banner_free():
+    # BUG #2 (found live): codex's startup banner (stdout) leaked into the report
+    # header's "(reason)". Clean it + classify rate-limit precisely.
+    from plugins.google_meet.meet_summarize import _clean_codex_reason, _extractive_report
+
+    banner = ("Reading additional input from stdin...\nOpenAI Codex v0.132.0\n"
+              "--------\nworkdir: /home/x\nmodel: gpt-5")
+    cleaned = _clean_codex_reason(banner)
+    for noise in ("OpenAI Codex", "workdir", "Reading additional input", "model: gpt-5"):
+        assert noise not in cleaned
+
+    # The real API error message is surfaced when present.
+    j = "{'error': {'type': 'usage_limit_reached', 'message': 'The usage limit has been reached'}}"
+    assert _clean_codex_reason(j) == "The usage limit has been reached"
+
+    # Full header: rate-limited classification wins and no banner leaks through.
+    md = _extractive_report("abc-defg-hij", "You: привет\nВиталий: пока",
+                            reason=banner, rate_limited=True)
+    assert "превышен лимит" in md
+    assert "OpenAI Codex" not in md and "workdir" not in md
 
 
 def test_transcript_reader_exposes_clean_lines(tmp_path):

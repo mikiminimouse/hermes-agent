@@ -257,7 +257,38 @@ _ACTION_RE = re.compile(
     r"исправ|добав|подготов|запиш|разобрать|выясни|todo|fix|check)\b", re.IGNORECASE)
 
 
-def _extractive_report(meeting_id: str, transcript_text: str, reason: str) -> str:
+# Banner/noise lines codex prints to stdout that must NOT leak into the report
+# header (bug: the whole banner ended up in the "(reason)" parens).
+_CODEX_BANNER_RE = re.compile(
+    r"^(reading additional input|openai codex v|-{3,}|workdir:|model:|provider:|"
+    r"approval:|sandbox:|reasoning( effort| summaries)?:|tokens used:|session id:|"
+    r"\[[0-9]{4}-)", re.IGNORECASE)
+
+
+def _clean_codex_reason(reason: str) -> str:
+    """Distil a concise, human-readable failure reason from codex's raw output,
+    dropping the startup banner so it never pollutes the report header."""
+    r = (reason or "").strip()
+    # Prefer the actual API error message if present.
+    m = (re.search(r"['\"]message['\"]\s*:\s*['\"]([^'\"]+)['\"]", r)
+         or re.search(r"\bmessage\b\s*[:=]\s*(.+)", r))
+    if m:
+        return m.group(1).strip()[:160]
+    low = r.lower()
+    if "usage_limit" in low or "usage limit" in low:
+        return "достигнут лимит использования codex"
+    if re.search(r"\b429\b|rate.?limit|too many requests", low):
+        return "codex rate limit (429)"
+    # Otherwise take the first line that isn't codex banner noise.
+    for line in r.splitlines():
+        s = line.strip()
+        if s and not _CODEX_BANNER_RE.match(s):
+            return s[:160]
+    return "ошибка codex (детали в summary_request.json)"
+
+
+def _extractive_report(meeting_id: str, transcript_text: str, reason: str,
+                       rate_limited: bool = False) -> str:
     """LLM-free fallback report so a meeting is NEVER lost when codex is down
     (e.g. 429 usage_limit). Pure extraction from the deduplicated transcript:
     participants, heuristic action-ish lines, and the full turn list. Lower
@@ -271,14 +302,18 @@ def _extractive_report(meeting_id: str, transcript_text: str, reason: str) -> st
             if sp and sp.lower() != "you" and sp not in speakers:
                 speakers.append(sp)
     actions = [l for l in lines if _ACTION_RE.search(l)][:25]
+    # resets_in_seconds is parsed from the RAW reason (it lives in the API JSON);
+    # the displayed reason is the cleaned, banner-free version.
     m = re.search(r"resets_in_seconds['\"]?\s*[:=]\s*(\d+)", reason)
     reset_note = (f" Квота восстановится примерно через {int(int(m.group(1)) / 60)} мин — "
                   "тогда можно перегенерировать полноценный отчёт.") if m else ""
+    display_reason = ("превышен лимит использования codex (429)"
+                      if rate_limited else _clean_codex_reason(reason))
     md = [
         f"# Итоги встречи — {meeting_id}",
         "",
         f"> ⚠️ Экстрактивный фолбэк БЕЗ LLM: авто-суммаризатор (codex) недоступен "
-        f"({reason[:160]}).{reset_note} Ниже — извлечение из транскрипта; для "
+        f"({display_reason}).{reset_note} Ниже — извлечение из транскрипта; для "
         "связного отчёта перезапусти суммаризацию позже.",
         "",
         f"**Участники:** {', '.join(speakers) if speakers else 'не определены'}",
@@ -362,9 +397,14 @@ def summarize(meeting_dir: Path) -> int:
         rate_limited = bool(re.search(
             r"usage_limit|rate.?limit|\b429\b|too many requests", cerr, re.IGNORECASE))
         # FALLBACK: never lose the meeting — write an extractive (LLM-free) report.
+        # Pass a generous slice (the API JSON with the message/resets_in can be far
+        # past the banner) + the rate_limited classification; _extractive_report
+        # distils a clean, banner-free reason for the header.
         try:
-            report.write_text(_extractive_report(meeting_id, transcript_text, cerr[:300]),
-                              encoding="utf-8")
+            report.write_text(
+                _extractive_report(meeting_id, transcript_text, cerr[:2000],
+                                   rate_limited=rate_limited),
+                encoding="utf-8")
             _update_marker(
                 marker, status="done_extractive", reportPath=str(report),
                 summarizedAt=time.time(),
