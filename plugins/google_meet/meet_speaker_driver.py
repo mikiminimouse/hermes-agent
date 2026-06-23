@@ -187,6 +187,25 @@ def _norm_task(t: str) -> str:
     return re.sub(r"[^\w\s]", " ", (t or "").lower())
 
 
+# Deterministic guard against re-greeting: strip a LEADING greeting from ongoing
+# replies (the greeting is said once on join). Prompt alone is soft for a small
+# model (Haiku mirrors the user's "Привет"), so we enforce it in code too.
+_LEADING_GREETING_RE = re.compile(
+    r"^(?:\s*(?:привет(?:ствую)?|здравствуй(?:те)?|здаров[ао]?|хай|hi|hello|hey|доброе утро|добрый (?:день|вечер))"
+    r"[\s,!.…—-]*)+",
+    re.IGNORECASE)
+
+
+def _strip_greeting(reply: str) -> str:
+    """Remove a leading greeting from an ongoing reply; keep the rest intact.
+    If the reply is ONLY a greeting, leave it (rare — a deliberate hello)."""
+    stripped = _LEADING_GREETING_RE.sub("", reply or "", count=1).lstrip()
+    if not stripped:
+        return reply
+    # Capitalize the new first letter so the sentence still reads naturally.
+    return stripped[0].upper() + stripped[1:]
+
+
 def _try_delegate(task: str, context: str, out_dir) -> str:
     """Spawn a background tool-capable agent for *task* unless one is already
     running or the task duplicates a recent one. Returns the line to speak."""
@@ -554,6 +573,7 @@ def main(argv) -> int:
                     _say(msg)
                     _log(out_dir, f"delegate→ {msg[:32]} | {task[:60]}")
                 else:
+                    reply = _strip_greeting(reply)   # no re-greeting in dialogue
                     # Reply-dedup against ONLY the last REPLY_DEDUP_KEEP replies
                     # (not a time window) so a back-to-back A/B/A repeat is caught
                     # but a genuine re-ask after a few turns is treated as fresh.

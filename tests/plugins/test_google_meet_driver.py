@@ -51,6 +51,20 @@ def test_pick_addressed_turn_reacts_to_in_place_refinement():
     assert a == 4
 
 
+def test_strip_greeting_removes_leading_hello():
+    # Deterministic guard so the bot doesn't re-greet in ongoing replies even
+    # when the small model ignores the prompt rule.
+    d = _drv()
+    assert d._strip_greeting("Привет! Я здесь, что нужно?") == "Я здесь, что нужно?"
+    assert d._strip_greeting("Привет, сегодня помогал команде.") == "Сегодня помогал команде."
+    assert d._strip_greeting("Здравствуйте! Чем помочь?") == "Чем помочь?"
+    assert d._strip_greeting("привет привет, слушаю тебя") == "Слушаю тебя"
+    # No leading greeting → untouched.
+    assert d._strip_greeting("Да, могу сделать это в фоне.") == "Да, могу сделать это в фоне."
+    # A reply that is ONLY a greeting is kept (rare deliberate hello).
+    assert d._strip_greeting("Привет") == "Привет"
+
+
 def test_pick_addressed_turn_ignores_self_and_unchanged():
     d = _drv()
     processed: set = set()
