@@ -313,6 +313,27 @@ def test_adaptive_finalize_pause():
     assert _finalize_pause("вертер?") == _CAPTION_FINALIZE_PAUSE_FAST
 
 
+def test_max_utterance_cap_finalizes_continuous_speech(tmp_path):
+    # Continuous speech: the caption keeps updating (no pause matures) so neither
+    # the pause timer nor a speaker change fires — the growth cap must force-close
+    # it so the bot can answer a long address instead of staying mute.
+    from plugins.google_meet.meet_bot import _BotState, _CAPTION_MAX_UTTERANCE
+
+    out = tmp_path / "s"
+    state = _BotState(out_dir=out, meeting_id="x-y-z",
+                      url="https://meet.google.com/x-y-z")
+    state.record_caption("Алиса", "вертер слушай это очень длинная непрерывная речь")
+    buf = state._live["Алиса"]
+    now = buf["updated"]
+    # Caption JUST updated (no mature pause) → not finalized yet.
+    state.tick_finalize(now=now)
+    assert _clean_entries(out) == []
+    # It has been GROWING past the cap (updated still fresh) → force-finalize.
+    buf["started"] = now - (_CAPTION_MAX_UTTERANCE + 1)
+    state.tick_finalize(now=now)
+    assert len(_clean_entries(out)) == 1
+
+
 def test_farewell_detected_on_refine_path(tmp_path):
     # BUG #1 (found live, upa-pwci-tmk): a farewell appended to a GROWING turn is
     # folded as a refinement (rewrite-in-place), which early-returns. Presence +

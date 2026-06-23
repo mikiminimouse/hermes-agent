@@ -103,6 +103,14 @@ _CAPTION_FINALIZE_PAUSE = float(os.environ.get("HERMES_MEET_FINALIZE_PAUSE", "2.
 # principle, applied to text since Meet captions rarely carry punctuation).
 _CAPTION_FINALIZE_PAUSE_FAST = float(
     os.environ.get("HERMES_MEET_FINALIZE_PAUSE_FAST", "0.8"))
+# Max seconds a single speaker's utterance may GROW before we force-finalize it
+# even without a pause. Catch-all for continuous speech: when one person talks
+# nonstop (no speaker change) AND Meet's constant caption re-render keeps
+# resetting the pause timer, the turn would otherwise never settle and the bot
+# stays mute on a long address. Force-close so it can respond within this window;
+# refine-dedup folds the continuation into the same id (AssemblyAI max_turn cue).
+_CAPTION_MAX_UTTERANCE = float(
+    os.environ.get("HERMES_MEET_MAX_UTTERANCE", "10.0"))
 # Words that signal "more is coming" — a turn ending here is NOT finalized fast;
 # we wait out the full pause so we don't cut the speaker off mid-thought.
 # Russian conjunctions/prepositions/fillers + common English function words.
@@ -514,7 +522,12 @@ class _BotState:
         ref = now if now is not None else time.time()
         for speaker in list(self._live.keys()):
             buf = self._live[speaker]
-            if ref - buf["updated"] >= _finalize_pause(buf.get("norm", "")):
+            static_for = ref - buf["updated"]
+            growing_for = ref - buf.get("started", buf["updated"])
+            # Finalize on an adaptive pause OR a hard growth cap (continuous speech
+            # that never pauses long enough — see _CAPTION_MAX_UTTERANCE).
+            if (static_for >= _finalize_pause(buf.get("norm", ""))
+                    or growing_for >= _CAPTION_MAX_UTTERANCE):
                 self._finalize_speaker(speaker)
 
     def dialogue_end_reason(self, now: float) -> Optional[str]:
